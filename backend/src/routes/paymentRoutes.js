@@ -9,30 +9,36 @@ const {
   verifyPayment,
   submitTransaction,
   verifyTransactionHash,
-  syncAllPayments,
-  getSyncStatus,
-  finalizePayments,
-  getStudentPayments,
+} = require('../controllers/paymentController');
+
+const {
   getAcceptedAssets,
   getPaymentLimitsEndpoint,
+  getStudentPayments,
+  getAllPayments,
   getOverpayments,
   getStudentBalance,
   getSuspiciousPayments,
   getPendingPayments,
   getRetryQueue,
   getExchangeRates,
-  getAllPayments,
-  getDeadLetterJobs,
-  retryDeadLetterJob,
+  getPaymentSummary,
+} = require('../controllers/paymentQueryController');
+
+const {
+  syncAllPayments,
+  getSyncStatus,
+  finalizePayments,
+  generateReceipt,
   lockPaymentForUpdate,
   unlockPayment,
-  generateReceipt,
+  getDeadLetterJobs,
+  retryDeadLetterJob,
   getQueueJobStatus,
-  streamPaymentEvents,
-  getPaymentSummary,
-  updatePaymentStatus,
   getStuckPayments,
-} = require("../controllers/paymentController");
+  updatePaymentStatus,
+  streamPaymentEvents,
+} = require('../controllers/paymentAdminController');
 
 const {
   validateStudentIdParam,
