@@ -16,6 +16,12 @@ jest.mock('../backend/src/config/database', () => ({
   connect: jest.fn().mockResolvedValue(true),
   disconnect: jest.fn().mockResolvedValue(true),
   healthCheck: jest.fn().mockResolvedValue({ healthy: true }),
+  TRANSACTION_CONFIG: {
+    readConcern: 'majority',
+    writeConcern: 'majority',
+    journal: true,
+    transactionTimeoutMs: 30000,
+  },
 }));
 
 jest.mock('../backend/src/models/paymentModel', () => ({

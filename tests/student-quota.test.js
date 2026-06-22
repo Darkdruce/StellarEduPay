@@ -128,6 +128,11 @@ jest.mock('../backend/src/services/auditService', () => ({
   logAudit: jest.fn().mockResolvedValue(undefined),
 }));
 
+jest.mock('../backend/src/middleware/auth', () => ({
+  requireAdminAuth: (req, res, next) => next(),
+  requireAuth: (req, res, next) => next(),
+}));
+
 const app = require('../backend/src/app');
 
 const SCHOOL_HEADERS = { 'X-School-ID': 'SCH001' };

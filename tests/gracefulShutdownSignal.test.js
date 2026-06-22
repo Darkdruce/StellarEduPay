@@ -132,11 +132,11 @@ describe('SIGTERM graceful shutdown', () => {
     jest.doMock('../backend/src/routes/adminRoutes', () => ({}));
     jest.doMock('../backend/src/routes/authRoutes', () => ({}));
 
-    jest.doMock('../backend/src/utils/logger', () => ({
-      info: jest.fn(),
-      warn: jest.fn(),
-      error: jest.fn(),
-    }));
+    jest.doMock('../backend/src/utils/logger', () => {
+      const log = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+      log.child = jest.fn(() => log);
+      return log;
+    });
 
     jest.doMock('../backend/src/utils/corsOrigins', () => ({
       parseAllowedOrigins: jest.fn(() => []),

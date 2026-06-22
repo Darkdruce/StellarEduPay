@@ -162,25 +162,25 @@ describe('POST /api/fee-adjustments — create a rule', () => {
   test('400 — missing name', async () => {
     const res = await adminApi('post', '/api/fee-adjustments').send({ type: 'discount_percentage', value: 10 });
     expect(res.status).toBe(400);
-    expect(res.body).toHaveProperty('code', 'VALIDATION_ERROR');
+    expect(res.body).toHaveProperty(['error', 'code'], 'VALIDATION_ERROR');
   });
 
   test('400 — missing type', async () => {
     const res = await adminApi('post', '/api/fee-adjustments').send({ name: 'Test', value: 10 });
     expect(res.status).toBe(400);
-    expect(res.body).toHaveProperty('code', 'VALIDATION_ERROR');
+    expect(res.body).toHaveProperty(['error', 'code'], 'VALIDATION_ERROR');
   });
 
   test('400 — invalid type value', async () => {
     const res = await adminApi('post', '/api/fee-adjustments').send({ name: 'Test', type: 'invalid_type', value: 10 });
     expect(res.status).toBe(400);
-    expect(res.body).toHaveProperty('code', 'VALIDATION_ERROR');
+    expect(res.body).toHaveProperty(['error', 'code'], 'VALIDATION_ERROR');
   });
 
   test('400 — negative value', async () => {
     const res = await adminApi('post', '/api/fee-adjustments').send({ name: 'Test', type: 'discount_fixed', value: -5 });
     expect(res.status).toBe(400);
-    expect(res.body).toHaveProperty('code', 'VALIDATION_ERROR');
+    expect(res.body).toHaveProperty(['error', 'code'], 'VALIDATION_ERROR');
   });
 
   test('409 — duplicate rule name for same school', async () => {
@@ -193,7 +193,7 @@ describe('POST /api/fee-adjustments — create a rule', () => {
     });
 
     expect(res.status).toBe(409);
-    expect(res.body).toHaveProperty('code', 'DUPLICATE_RULE');
+    expect(res.body).toHaveProperty(['error', 'code'], 'DUPLICATE_RULE');
   });
 
   test('401 — unauthenticated request is rejected', async () => {
@@ -292,7 +292,7 @@ describe('PUT /api/fee-adjustments/:id — update a rule', () => {
     });
 
     expect(res.status).toBe(404);
-    expect(res.body).toHaveProperty('code', 'NOT_FOUND');
+    expect(res.body).toHaveProperty(['error', 'code'], 'NOT_FOUND');
   });
 
   test('400 — invalid body on update', async () => {
@@ -300,7 +300,7 @@ describe('PUT /api/fee-adjustments/:id — update a rule', () => {
       name: 'Test', type: 'bad_type', value: 10,
     });
     expect(res.status).toBe(400);
-    expect(res.body).toHaveProperty('code', 'VALIDATION_ERROR');
+    expect(res.body).toHaveProperty(['error', 'code'], 'VALIDATION_ERROR');
   });
 
   test('401 — unauthenticated request is rejected', async () => {
@@ -349,7 +349,7 @@ describe('DELETE /api/fee-adjustments/:id — deactivate a rule', () => {
     const res = await adminApi('delete', '/api/fee-adjustments/000000000000000000000000');
 
     expect(res.status).toBe(404);
-    expect(res.body).toHaveProperty('code', 'NOT_FOUND');
+    expect(res.body).toHaveProperty(['error', 'code'], 'NOT_FOUND');
   });
 
   test('401 — unauthenticated request is rejected', async () => {

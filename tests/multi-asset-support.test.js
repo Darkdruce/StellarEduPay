@@ -59,14 +59,26 @@ jest.mock('../backend/src/models/studentModel', () => ({
 
 jest.mock('../backend/src/services/currencyConversionService', () => ({
   convertAmount: jest.fn((amount, fromAsset, toAsset) => {
-    if (fromAsset === 'USDC' && toAsset === 'USD') {
-      return amount; // 1:1 conversion for USDC
-    }
-    if (fromAsset === 'XLM' && toAsset === 'USD') {
-      return amount * 0.1; // Mock XLM to USD rate
-    }
+    if (fromAsset === 'USDC' && toAsset === 'USD') return amount;
+    if (fromAsset === 'XLM' && toAsset === 'USD') return amount * 0.1;
     return amount;
   }),
+  convertToLocalCurrency: jest.fn().mockResolvedValue({ available: false }),
+  enrichPaymentWithConversion: jest.fn().mockImplementation((p) => Promise.resolve(p)),
+}));
+
+jest.mock('../backend/src/config/stellarConfig', () => ({
+  server: { transactions: jest.fn(), ledgers: jest.fn() },
+  SCHOOL_WALLET: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+  isAcceptedAsset: jest.fn((code, type) => ({
+    accepted: ['XLM', 'USDC'].includes(code) || type === 'native',
+  })),
+  ACCEPTED_ASSETS: {
+    XLM: { code: 'XLM', type: 'native' },
+    USDC: { code: 'USDC', type: 'credit_alphanum4' },
+  },
+  CONFIRMATION_THRESHOLD: 3,
+  FINALIZATION_THRESHOLD: 10,
 }));
 
 const app = require('../backend/src/app');
