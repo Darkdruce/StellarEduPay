@@ -7,6 +7,7 @@ const { concurrentPaymentProcessor } = require('../services/concurrentPaymentPro
 const { getReminderStatus } = require('../services/reminderService');
 const { getCachedRates } = require('../services/currencyConversionService');
 const { getAuditHealth } = require('../services/auditService');
+const { getRedisStatus } = require('../config/redisClient');
 const logger = require('../utils/logger');
 
 const STELLAR_CHECK_TIMEOUT_MS = 3000; // 3 second timeout for Stellar health check
@@ -79,11 +80,6 @@ async function healthCheck(req, res) {
   }
 
   const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
-
-  // Retry queue backend info
-  const retrySelector = require('../services/retryServiceSelector');
-  const retryBackend = retrySelector.getSelectedBackend();
-  const redisConfigured = Boolean(process.env.REDIS_HOST);
 
   // Retry queue init status. For the Redis-backed BullMQ pipeline this reflects
   // whether initializeRetryQueue() succeeded; for the MongoDB fallback it reflects
@@ -163,4 +159,52 @@ async function healthCheck(req, res) {
   return res.status(statusCode).json(body);
 }
 
-module.exports = { healthCheck };
+/**
+ * GET /health/live
+ * Liveness probe: returns 200 if the process is running and responsive.
+ * No external dependency checks — if this fails, the container should restart.
+ */
+async function healthLive(req, res) {
+  return res.status(200).json({ status: 'alive', timestamp: new Date().toISOString() });
+}
+
+/**
+ * GET /health/ready
+ * Readiness probe: returns 200 only when the service can handle traffic.
+ * Checks DB and Horizon; returns 503 if either is unavailable.
+ */
+async function healthReady(req, res) {
+  const [dbResult, stellarResult] = await Promise.allSettled([
+    database.healthCheck(),
+    checkStellar(),
+  ]);
+
+  const db =
+    dbResult.status === 'fulfilled'
+      ? dbResult.value
+      : { healthy: false, reason: dbResult.reason?.message };
+
+  const stellar =
+    stellarResult.status === 'fulfilled'
+      ? stellarResult.value
+      : { status: 'unreachable', error: stellarResult.reason?.message };
+
+  const ready = db.healthy === true && stellar.status === 'ok';
+  const statusCode = ready ? 200 : 503;
+
+  return res.status(statusCode).json({
+    status: ready ? 'ready' : 'not_ready',
+    timestamp: new Date().toISOString(),
+    checks: {
+      database: { status: db.healthy ? 'healthy' : 'unhealthy', ...(db.reason && { error: db.reason }) },
+      stellar: {
+        status: stellar.status,
+        activeEndpoint: stellar.activeUrl || config.HORIZON_URL,
+        endpoints: stellar.endpoints || [],
+        ...(stellar.error && { error: stellar.error }),
+      },
+    },
+  });
+}
+
+module.exports = { healthCheck, healthLive, healthReady };

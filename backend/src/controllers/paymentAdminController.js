@@ -259,8 +259,8 @@ async function getStuckPayments(req, res, next) {
 
 // Allowed manual status transitions: from → [to, ...]
 const ALLOWED_TRANSITIONS = {
-  SUCCESS: ['DISPUTED'],
-  PENDING: ['FAILED'],
+  SUCCESS:   ['DISPUTED', 'REFUNDED'],
+  PENDING:   ['FAILED'],
   SUBMITTED: ['FAILED'],
 };
 

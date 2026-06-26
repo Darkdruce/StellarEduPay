@@ -105,11 +105,25 @@ async function getAuditLogs(filters = {}) {
     if (endDate) query.createdAt.$lte = new Date(endDate);
   }
 
-  const actualLimit = Math.min(limit, 200);
-  const skip = (page - 1) * actualLimit;
+  const actualLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+  const actualPage = Math.max(parseInt(page, 10) || 1, 1);
+  const skip = (actualPage - 1) * actualLimit;
+
+  // Select the most specific compound index to avoid COLLSCAN
+  let indexHint;
+  if (action) {
+    indexHint = { schoolId: 1, action: 1, createdAt: -1 };
+  } else if (performedBy) {
+    indexHint = { schoolId: 1, performedBy: 1, createdAt: -1 };
+  } else if (targetType) {
+    indexHint = { schoolId: 1, targetType: 1, createdAt: -1 };
+  } else {
+    indexHint = { schoolId: 1, createdAt: -1 };
+  }
 
   const [logs, total] = await Promise.all([
     AuditLog.find(query)
+      .hint(indexHint)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(actualLimit)
@@ -120,7 +134,7 @@ async function getAuditLogs(filters = {}) {
   return {
     logs,
     total,
-    page,
+    page: actualPage,
     limit: actualLimit,
     pages: Math.ceil(total / actualLimit) || 1,
   };
