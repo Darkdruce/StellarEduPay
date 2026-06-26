@@ -80,11 +80,6 @@ async function healthCheck(req, res) {
 
   const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
 
-  // Retry queue backend info
-  const retrySelector = require('../services/retryServiceSelector');
-  const retryBackend = retrySelector.getSelectedBackend();
-  const redisConfigured = Boolean(process.env.REDIS_HOST);
-
   // Retry queue init status. For the Redis-backed BullMQ pipeline this reflects
   // whether initializeRetryQueue() succeeded; for the MongoDB fallback it reflects
   // whether the worker is running.
