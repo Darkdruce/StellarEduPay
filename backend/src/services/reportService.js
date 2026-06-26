@@ -10,7 +10,7 @@ const FeeStructure = require('../models/feeStructureModel');
  * @param {{ schoolId: string, startDate?: string, endDate?: string, timezone?: string }} options
  */
 async function aggregateByDate({ schoolId, startDate, endDate, timezone = 'UTC' } = {}) {
-  const match = { schoolId, status: 'SUCCESS', studentDeleted: { $ne: true } };
+  const match = { schoolId, status: 'SUCCESS', studentDeleted: { $ne: true }, deletedAt: null };
 
   if (startDate || endDate) {
     match.confirmedAt = {};
