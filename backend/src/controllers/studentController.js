@@ -604,14 +604,8 @@ async function bulkImportStudents(req, res, next) {
     const { schoolId } = req;
     let rows;
 
-    if (req.file) {
-      if (req.file.size > CSV_MAX_SIZE_BYTES) {
-        return res.status(413).json({
-          error: `CSV file exceeds maximum allowed size of ${CSV_MAX_SIZE_BYTES} bytes`,
-          code: 'CSV_TOO_LARGE',
-        });
-      }
-      rows = await parseCsvBuffer(req.file.buffer);
+    if (req.parsedRows) {
+      rows = req.parsedRows;
     } else if (req.body && Array.isArray(req.body.students)) {
       rows = req.body.students;
     } else {

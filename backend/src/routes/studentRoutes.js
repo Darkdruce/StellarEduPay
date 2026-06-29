@@ -2,7 +2,6 @@
 
 const express = require('express');
 const router = express.Router();
-const multer = require('multer');
 const {
   registerStudent,
   getAllStudents,
@@ -26,14 +25,13 @@ const { resolveSchool } = require('../middleware/schoolContext');
 const { requireAdminAuth } = require('../middleware/auth');
 const { auditContext } = require('../middleware/auditContext');
 const { bulkImportLimiter } = require('../middleware/rateLimiter');
-
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const streamingCsvUpload = require('../middleware/streamingCsvUpload');
 
 router.use(resolveSchool);
 
 // Admin-only routes
 router.post('/', requireAdminAuth, validateRegisterStudent, registerStudent);
-router.post('/bulk', requireAdminAuth, bulkImportLimiter, express.json({ limit: '1mb' }), upload.single('file'), bulkImportStudents);
+router.post('/bulk', requireAdminAuth, bulkImportLimiter, express.json({ limit: '1mb' }), streamingCsvUpload(), bulkImportStudents);
 router.get('/', requireAdminAuth, getAllStudents);
 router.get('/export', requireAdminAuth, exportStudents);
 
