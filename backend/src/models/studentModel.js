@@ -39,6 +39,14 @@ const studentSchema = new mongoose.Schema(
     reminderCount: { type: Number, default: 0 },
     reminderOptOut: { type: Boolean, default: false },
 
+    /**
+     * Academic period to which the current reminderCount applies.
+     * Reset reminderCount when a new fee period begins (e.g. "2025-2026").
+     * Prevents a perpetually-unpaid fee from generating endless reminders
+     * across multiple academic years.
+     */
+    reminderPeriod: { type: String, default: null },
+
     // Audit fields
     dateOfBirth: { type: Date },
     gender: { type: String },

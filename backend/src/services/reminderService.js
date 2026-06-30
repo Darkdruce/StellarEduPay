@@ -76,13 +76,43 @@ function isInSendWindow(school) {
 }
 
 /**
- * Determine whether a student is eligible for a reminder right now.
+ * Determine the reminder escalation level for a student based on deadline proximity.
+ *
+ * Levels:
+ *   1 — early reminder (>= 7 days before deadline, or no deadline set)
+ *   2 — approaching deadline (1–6 days before)
+ *   3 — overdue (past deadline)
  */
-function isEligible(student) {
+function computeEscalationLevel(student) {
+  if (!student.paymentDeadline) return 1;
+
+  const now = new Date();
+  const deadline = new Date(student.paymentDeadline);
+  const daysUntilDeadline = Math.ceil((deadline - now) / (1000 * 60 * 60 * 24));
+
+  if (daysUntilDeadline <= 0) return 3; // overdue
+  if (daysUntilDeadline <= 6) return 2; // approaching
+  return 1; // early
+}
+
+/**
+ * Determine whether a student is eligible for a reminder right now.
+ * Respects the per-fee-period cap so a perpetually-unpaid fee does not
+ * generate endless reminders across academic years.
+ */
+function isEligible(student, school) {
   if (student.feePaid)          return false;
   if (!student.parentEmail)     return false;
   if (student.reminderOptOut)   return false;
   if (student.reminderCount >= REMINDER_MAX_COUNT) return false;
+
+  // Scope reminder count to the current fee period.
+  // Reset tracking when period changes so each term/year starts fresh.
+  const currentPeriod = school.settings?.currentFeePeriod || student.academicYear;
+  if (currentPeriod && student.reminderPeriod !== currentPeriod) {
+    // Period changed — reset count for this student on the fly
+    return true; // eligible, period will be updated on send
+  }
 
   if (student.lastReminderSentAt) {
     const cooldownMs = REMINDER_COOLDOWN_HOURS * 60 * 60 * 1000;
@@ -155,7 +185,7 @@ async function processReminders() {
     });
 
     for (const student of unpaidStudents) {
-      if (!isEligible(student)) {
+      if (!isEligible(student, school)) {
         summary.skipped++;
         continue;
       }
@@ -210,6 +240,9 @@ async function processReminders() {
           throw err;
         }
 
+        const escalationLevel = computeEscalationLevel(student);
+        const currentPeriod = school.settings?.currentFeePeriod || student.academicYear;
+
         const result = await sendFeeReminder({
           to:               student.parentEmail,
           studentName:      student.name,
@@ -220,18 +253,24 @@ async function processReminders() {
           remainingBalance,
           schoolName:       school.name,
           reminderCount:    (student.reminderCount || 0) + 1,
+          escalationLevel,
+          paymentDeadline:  student.paymentDeadline,
         });
 
         // Only update tracking fields if email was actually sent
         if (result.sent) {
+          const updateFields = {
+            $set: {
+              lastReminderSentAt: new Date(),
+              reminderPeriod: currentPeriod,
+            },
+            $inc: { reminderCount: 1 },
+          };
           await Promise.all([
-            Student.findByIdAndUpdate(student._id, {
-              $set: { lastReminderSentAt: new Date() },
-              $inc: { reminderCount: 1 },
-            }),
+            Student.findByIdAndUpdate(student._id, updateFields),
             ReminderLog.updateOne(
               { schoolId: school.schoolId, studentId: student.studentId, windowStart },
-              { $set: { status: 'sent', sentAt: new Date() } }
+              { $set: { status: 'sent', sentAt: new Date(), escalationLevel } }
             ),
           ]);
           summary.sent++;
