@@ -5,7 +5,7 @@ const School = require('../models/schoolModel');
 const Payment = require('../models/paymentModel');
 const Student = require('../models/studentModel');
 const { server } = require('../config/stellarConfig');
-const { extractValidPayment, validatePaymentAgainstFee, detectMemoCollision, detectCrossSchoolMemoCollision, detectAbnormalPatterns, determineConfirmationState } = require('./stellarService');
+const { extractValidPayment, detectMemoCollision, detectCrossSchoolMemoCollision, detectAbnormalPatterns, determineConfirmationState } = require('./stellarService');
 const { CONFIRMATION_STATES, isConfirmedOrAbove } = require('./paymentConfirmationStateMachine');
 const { validatePaymentAmount } = require('../utils/paymentLimits');
 const { compareAmounts, toStroops, stroopsToNumber, normalizeToNumber } = require('../utils/stellarAmount');
@@ -40,7 +40,7 @@ let currentIntervalMs = SYNC_INTERVAL_MS;
 /**
  * Process a single transaction for a school
  */
-async function processTransaction(tx, school) {
+async function processTransaction(tx, school, fencingToken) {
   const { schoolId, stellarAddress } = school;
   const correlationId = deriveCorrelationId(tx.hash);
 
@@ -82,6 +82,18 @@ async function processTransaction(tx, school) {
   if (!student) {
     logger.warn('Student not found for memo', { txHash: tx.hash, correlationId, schoolId, memo });
     return { processed: false, reason: 'student_not_found' };
+  }
+
+  // Check fencing token - reject if stale (another worker has newer lock)
+  const currentFence = await lock.getCurrentFence(`sync:lock:${schoolId}`);
+  if (currentFence !== null && currentFence !== fencingToken) {
+    logger.warn('Stale fencing token - another worker acquired lock', {
+      schoolId,
+      expectedFence: fencingToken,
+      currentFence,
+      txHash: tx.hash,
+    });
+    return { processed: false, reason: 'stale_lock' };
   }
 
   const senderAddress = payOp.from || null;
@@ -132,8 +144,6 @@ async function processTransaction(tx, school) {
   const excessAmount = cumulativeStatus === 'overpaid'
     ? stroopsToNumber(toStroops(cumulativeTotal) - toStroops(student.feeAmount))
     : 0;
-
-  const feeValidation = validatePaymentAgainstFee(paymentAmount, student.feeAmount);
 
   // Extract network fee
   const networkFee = parseFloat(tx.fee_paid || '0') / 10000000;
@@ -251,13 +261,18 @@ async function processTransaction(tx, school) {
  */
 async function pollSchoolTransactions(school) {
   const lockKey = `sync:lock:${school.schoolId}`;
-  const token = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
-  if (!token) {
+  const acquired = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
+  if (!acquired) {
     logger.debug('Skipping school poll — sync lock held by another worker', {
       schoolId: school.schoolId,
     });
     return { schoolId: school.schoolId, processed: 0, skipped: 0, lockSkipped: true };
   }
+
+  const { token, fencingToken } = acquired;
+  const stopWatchdog = lock.startWatchdog
+    ? lock.startWatchdog(lockKey, token, SYNC_LOCK_TTL_MS)
+    : null;
 
   let cursor = school.syncCursor || null;
   const startCursor = cursor;
@@ -280,7 +295,7 @@ async function pollSchoolTransactions(school) {
       if (records.length === 0) break;
 
       for (const tx of records) {
-        const result = await processTransaction(tx, school);
+        const result = await processTransaction(tx, school, fencingToken);
         if (result.processed) {
           processedCount++;
         } else {
@@ -322,6 +337,7 @@ async function pollSchoolTransactions(school) {
     });
     return { schoolId: school.schoolId, error: error.message, horizonError: true, status };
   } finally {
+    if (stopWatchdog) stopWatchdog();
     await lock.release(lockKey, token);
   }
 }
