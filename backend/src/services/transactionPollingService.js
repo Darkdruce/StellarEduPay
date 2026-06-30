@@ -25,11 +25,15 @@ let isPolling = false;
 const SYNC_INTERVAL_MS = config.SYNC_INTERVAL_MS;
 // TTL of the per-school distributed sync lock (crash-safety net).
 const SYNC_LOCK_TTL_MS = config.SYNC_LOCK_TTL_MS;
-const TRANSACTIONS_PER_POLL = 20;
 // Safety cap on how many pages a single poll cycle will drain for one school.
 // Bounds per-cycle work while letting a fresh school's history backfill across
-// cycles (default: up to 50 pages × 20 = 1000 tx/cycle). Configurable.
+// cycles (default: up to 50 pages × batchSize tx/cycle). Configurable.
 const MAX_PAGES_PER_POLL = parseInt(process.env.SYNC_MAX_PAGES_PER_POLL || '50', 10);
+// Adaptive batch sizing (#972): the per-page Horizon fetch size scales down as
+// the processing queue fills, between MIN and MAX, starting from BASE.
+const BASE_TRANSACTIONS_PER_POLL = 20;
+const MIN_TRANSACTIONS_PER_POLL = 5;
+const MAX_TRANSACTIONS_PER_POLL = 50;
 
 // Exponential backoff state — reset on first successful poll after errors.
 // POLL_MAX_BACKOFF_MS defaults to 5 minutes; configurable via env var.
@@ -173,7 +177,7 @@ async function processTransaction(tx, school, fencingToken) {
     networkFee,
     // #883 — snapshot fiat rate at confirmation (best-effort; null if feed unavailable)
     fiatSnapshot: isConfirmed && !isSuspicious
-      ? await captureFiatSnapshot(paymentAmount, assetCode || 'XLM', process.env.DEFAULT_FIAT_CURRENCY || 'USD')
+      ? await captureFiatSnapshot(paymentAmount, asset || 'XLM', process.env.DEFAULT_FIAT_CURRENCY || 'USD')
       : null,
   };
 
@@ -259,7 +263,50 @@ async function processTransaction(tx, school, fencingToken) {
  * duplicate writes does not depend on the lock: the unique index on Payment
  * remains the authoritative dedup guard if the lock ever expires mid-poll.
  */
+function getQueueBackpressureState() {
+  try {
+    const { concurrentPaymentProcessor } = require('./concurrentPaymentProcessor');
+    const { queueDepth, maxQueueDepth } = concurrentPaymentProcessor.getStats();
+    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, maxQueueDepth);
+    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
+    return { queueDepth, maxQueueDepth, highWater, lowWater };
+  } catch (error) {
+    logger.warn('Unable to read payment processor stats for polling backpressure', {
+      error: error.message,
+    });
+    const highWater = Math.min(config.QUEUE_BACKPRESSURE_HIGH_WATER, config.MAX_QUEUE_DEPTH);
+    const lowWater = Math.min(config.QUEUE_BACKPRESSURE_LOW_WATER, Math.max(0, highWater - 1));
+    return { queueDepth: 0, maxQueueDepth: config.MAX_QUEUE_DEPTH, highWater, lowWater };
+  }
+}
+
+function getEffectiveBatchSize(queueDepth) {
+  const { highWater, lowWater } = getQueueBackpressureState();
+  if (queueDepth >= highWater) return 0;
+  if (queueDepth <= lowWater) return BASE_TRANSACTIONS_PER_POLL;
+
+  const pressureRatio = (queueDepth - lowWater) / Math.max(1, highWater - lowWater);
+  const scaled = Math.round(BASE_TRANSACTIONS_PER_POLL * (1 - pressureRatio));
+  return Math.max(MIN_TRANSACTIONS_PER_POLL, Math.min(MAX_TRANSACTIONS_PER_POLL, scaled));
+}
+
 async function pollSchoolTransactions(school) {
+  const backpressure = getQueueBackpressureState();
+  if (backpressure.queueDepth >= backpressure.highWater) {
+    logger.warn('Skipping school poll due to high payment processor queue depth', {
+      schoolId: school.schoolId,
+      queueDepth: backpressure.queueDepth,
+      highWater: backpressure.highWater,
+    });
+    return {
+      schoolId: school.schoolId,
+      processed: 0,
+      skipped: 0,
+      loadPaused: true,
+      queueDepth: backpressure.queueDepth,
+    };
+  }
+
   const lockKey = `sync:lock:${school.schoolId}`;
   const acquired = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
   if (!acquired) {
@@ -280,12 +327,24 @@ async function pollSchoolTransactions(school) {
   let skippedCount = 0;
 
   try {
+    // Adaptive batch size based on queue backpressure (#972). The early
+    // load-pause guard above already bails when the queue is saturated, so
+    // here batchSize is always >= MIN_TRANSACTIONS_PER_POLL.
+    const batchSize = getEffectiveBatchSize(backpressure.queueDepth);
+    if (batchSize !== BASE_TRANSACTIONS_PER_POLL) {
+      logger.debug('Adjusted poll batch size based on queue depth', {
+        schoolId: school.schoolId,
+        queueDepth: backpressure.queueDepth,
+        batchSize,
+      });
+    }
+
     for (let pages = 0; pages < MAX_PAGES_PER_POLL; pages++) {
       let builder = server
         .transactions()
         .forAccount(school.stellarAddress)
         .order('asc')
-        .limit(TRANSACTIONS_PER_POLL);
+        .limit(batchSize);
       // Resume from the persisted cursor; omit on first-ever run so Horizon
       // returns from the oldest transaction.
       if (cursor) builder = builder.cursor(cursor);
@@ -314,7 +373,7 @@ async function pollSchoolTransactions(school) {
         );
       }
 
-      if (records.length < TRANSACTIONS_PER_POLL) break; // drained this cycle
+      if (records.length < batchSize) break; // drained this cycle
     }
 
     if (processedCount > 0) {
