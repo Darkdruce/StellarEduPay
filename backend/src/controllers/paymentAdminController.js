@@ -16,6 +16,7 @@ const { syncPaymentsForSchool } = require('../services/stellarService');
 const { initiateRefund, getRefundsByPayment, getRefundsBySchool } = require('../services/refundService');
 const { generateReconciliationReport } = require('../services/reconciliationService');
 const lock = require('../services/distributedLock');
+const { ADMIN_PAYMENT_STATUS_TRANSITIONS } = require('../constants/paymentStatus');
 
 // TTL for the per-school distributed sync lock (60 s — long enough to complete
 // a full blockchain sync while short enough to auto-expire after a crash).
@@ -271,13 +272,10 @@ async function getStuckPayments(req, res, next) {
 }
 
 // Admin-allowed manual status transitions: from → [to, ...]
-// Mirrors ADMIN_PAYMENT_STATUS_TRANSITIONS in paymentModel.js.
-const ALLOWED_TRANSITIONS = {
-  SUCCESS:   ['DISPUTED', 'REFUNDED'],
-  PENDING:   ['FAILED'],
-  SUBMITTED: ['FAILED'],
-  DISPUTED:  ['REFUNDED'],
-};
+// Use the canonical transition table from constants/paymentStatus.js (Issue #72).
+// ADMIN_PAYMENT_STATUS_TRANSITIONS is the wider admin-path table that allows
+// transitions like DISPUTED → REFUNDED in addition to the normal set.
+const ALLOWED_TRANSITIONS = ADMIN_PAYMENT_STATUS_TRANSITIONS;
 
 async function updatePaymentStatus(req, res, next) {
   try {
