@@ -83,6 +83,7 @@ async function requireAdminAuth(req, res, next) {
     }
 
     req.admin = decoded;
+    req.user = decoded; // alias so downstream code works regardless of which middleware ran
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
