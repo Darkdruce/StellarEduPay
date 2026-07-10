@@ -20,13 +20,12 @@ const API_ORIGIN = (() => {
 // and styleSrc are meaningless for JSON. The frontend (Next.js) renders HTML
 // and is the correct place to enforce a browser-facing CSP.
 //
-// style-src needs 'unsafe-inline': the app styles its UI with inline <style>
-// blocks and React style={{}} props, and Next.js injects global CSS inline in
-// dev mode. Inline-style injection is low-risk compared to script injection,
-// so we keep script-src strict ('self') while permitting inline styles. We
-// also allow Google Fonts (fonts.googleapis.com stylesheet + gstatic webfonts).
-//
-// In development, script-src additionally needs 'unsafe-eval' for Next.js HMR.
+// CSP posture (issue #396): scripts are locked down — script-src is strict 'self'
+// in production (the meaningful XSS control). React/Next.js style the DOM with
+// inline styles (dynamic style props + Next's CSS injection), so style-src permits
+// 'unsafe-inline' — a low-risk allowance that is the industry-standard Next.js CSP
+// when per-request nonces aren't in use. Dev additionally needs script-src
+// 'unsafe-eval' for HMR; production never grants it.
 const scriptSrc = isDev ? "script-src 'self' 'unsafe-eval'" : "script-src 'self'";
 
 const CSP = [
@@ -52,10 +51,22 @@ const securityHeaders = [
   { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
 ];
 
+// Server-side origin of the backend, used by the dev proxy (rewrites) below.
+// Lets the browser call the API same-origin (/api/*) so cookies stay first-party
+// — essential in split-host setups like GitHub Codespaces.
+const BACKEND_ORIGIN = process.env.BACKEND_PROXY_TARGET || 'http://localhost:5000';
+
 const nextConfig = {
   // Produces a self-contained build in .next/standalone — required for Docker
   output: 'standalone',
   eslint: { ignoreDuringBuilds: true },
+  // Same-origin API proxy: browser → /api/* (this origin) → backend. Keeps
+  // requests first-party so HttpOnly SameSite=Strict auth cookies are sent.
+  async rewrites() {
+    return [
+      { source: '/api/:path*', destination: `${BACKEND_ORIGIN}/api/:path*` },
+    ];
+  },
   async headers() {
     return [
       {

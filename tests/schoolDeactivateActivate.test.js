@@ -1,5 +1,11 @@
 'use strict';
 
+// Set required env vars before app/config is loaded — config/index.js throws
+// without MONGO_URI.
+process.env.MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/test';
+process.env.SCHOOL_WALLET_ADDRESS = process.env.SCHOOL_WALLET_ADDRESS || 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret';
+
 /**
  * Tests for PATCH /api/schools/:id/deactivate and /activate — issue #453
  */
@@ -37,6 +43,7 @@ function mockRes() {
   const res = {};
   res.status = jest.fn().mockReturnValue(res);
   res.json = jest.fn().mockReturnValue(res);
+  res.set = jest.fn().mockReturnValue(res);
   return res;
 }
 
@@ -135,14 +142,8 @@ describe('School deactivate/activate endpoints — issue #453', () => {
       // schoolContext already queries { isActive: true } — simulate not found
       const { resolveSchool } = require('../backend/src/middleware/schoolContext');
 
-      jest.mock('../backend/src/cache', () => ({
-        get: jest.fn().mockReturnValue(null),
-        set: jest.fn(),
-        KEYS: { school: jest.fn((id) => `school:${id}`) },
-        TTL: { SCHOOL: 300 },
-      }));
-
-      School.findOne.mockResolvedValue(null); // inactive school not returned
+      // Return null from findOne (school not found) — lean() chain required by schoolContext
+      School.findOne.mockReturnValue({ lean: jest.fn().mockResolvedValue(null) });
 
       const req = { headers: { 'x-school-id': 'SCH-001' } };
       const res = mockRes();
@@ -150,7 +151,7 @@ describe('School deactivate/activate endpoints — issue #453', () => {
       await resolveSchool(req, res, nextFn);
 
       expect(res.status).toHaveBeenCalledWith(404);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'SCHOOL_NOT_FOUND' }));
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'NOT_FOUND' }));
     });
   });
 

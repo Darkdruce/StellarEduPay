@@ -3,12 +3,12 @@
 // #465 — partial feeValidationStatus
 
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 
 // ─── Mocks (all at top level so Jest hoisting works) ─────────────────────────
 
 jest.mock('../backend/src/config/stellarConfig', () => ({
-  SCHOOL_WALLET: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+  SCHOOL_WALLET: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
   CONFIRMATION_THRESHOLD: 2,
   ACCEPTED_ASSETS: { XLM: { code: 'XLM', type: 'native', issuer: null } },
   isAcceptedAsset: (code, type) =>
@@ -101,6 +101,18 @@ jest.mock('../backend/src/models/studentModel', () => ({
   findOneAndUpdate: jest.fn().mockResolvedValue({}),
 }));
 
+// stellarService wraps savePayment in a mongoose transaction session. Without a
+// mock, mongoose.connection.startSession() has no live DB and hangs to timeout.
+// stellarService (backend/src/services) resolves the DUPLICATE backend copy.
+jest.mock('../backend/node_modules/mongoose', () => ({
+  connection: {
+    startSession: jest.fn().mockResolvedValue({
+      withTransaction: async (fn) => { await fn(); },
+      endSession: jest.fn(),
+    }),
+  },
+}));
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 const { validatePaymentAgainstFee, syncPaymentsForSchool } = require('../backend/src/services/stellarService');
@@ -135,6 +147,7 @@ describe('#465 partial feeValidationStatus', () => {
 
       expect(mockSavePayment).toHaveBeenCalledWith(
         expect.objectContaining({ feeValidationStatus: 'partial' }),
+        expect.anything(),
       );
     });
 
@@ -146,6 +159,7 @@ describe('#465 partial feeValidationStatus', () => {
 
       expect(mockSavePayment).toHaveBeenCalledWith(
         expect.objectContaining({ feeValidationStatus: 'valid' }),
+        expect.anything(),
       );
     });
 
@@ -157,6 +171,7 @@ describe('#465 partial feeValidationStatus', () => {
 
       expect(mockSavePayment).toHaveBeenCalledWith(
         expect.objectContaining({ feeValidationStatus: 'overpaid' }),
+        expect.anything(),
       );
     });
   });

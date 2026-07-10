@@ -2,7 +2,7 @@
 
 // Must set required env vars before app is loaded (config/index.js validates on require)
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 process.env.JWT_SECRET = 'test-jwt-secret-for-payment-controller-suite';
 
 const request = require('supertest');
@@ -11,6 +11,7 @@ const request = require('supertest');
 
 jest.mock('../backend/src/middleware/auth', () => ({
   requireAdminAuth: (req, res, next) => next(),
+  requireSchoolAuth: () => (req, res, next) => next(),
 }));
 
 jest.mock('mongoose', () => ({
@@ -88,6 +89,7 @@ jest.mock('../backend/src/models/paymentModel', () => {
     create: jest.fn().mockResolvedValue({}),
     aggregate: jest.fn().mockResolvedValue([]),
     countDocuments: jest.fn((filter) => Promise.resolve(mockPayments.filter((p) => matchesFilter(p, filter)).length)),
+    activeFilter: jest.fn((filter = {}) => ({ ...filter, deletedAt: null })),
   };
 });
 
@@ -103,6 +105,18 @@ jest.mock('../backend/src/models/paymentIntentModel', () => ({
 jest.mock('../backend/src/models/idempotencyKeyModel', () => ({
   findOne: jest.fn().mockResolvedValue(null),
   create: jest.fn().mockResolvedValue({}),
+}));
+
+// The idempotency middleware talks to the idempotencyStore service (getFull/
+// reserve/complete), not the model directly. Mock the store so tests can drive
+// replay/first-call behavior. Defaults are the fresh-request path: no existing
+// record, reservation granted, so the request proceeds to the handler.
+jest.mock('../backend/src/services/idempotencyStore', () => ({
+  getFull: jest.fn().mockResolvedValue(null),
+  reserve: jest.fn().mockResolvedValue({ reserved: true }),
+  complete: jest.fn().mockResolvedValue(undefined),
+  release: jest.fn().mockResolvedValue(undefined),
+  IN_FLIGHT_TTL_MS: 30000,
 }));
 
 jest.mock('../backend/src/config/retryQueueSetup', () => ({
@@ -152,7 +166,7 @@ jest.mock('../backend/src/models/schoolModel', () => {
       schoolId: 'SCH001',
       name: 'Test School',
       slug: 'test-school',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
       isActive: true,
     },
@@ -160,7 +174,7 @@ jest.mock('../backend/src/models/schoolModel', () => {
       schoolId: 'SCH_A',
       name: 'School A',
       slug: 'school-a',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
       isActive: true,
     },
@@ -168,7 +182,7 @@ jest.mock('../backend/src/models/schoolModel', () => {
       schoolId: 'SCH_B',
       name: 'School B',
       slug: 'school-b',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
       isActive: true,
     },
@@ -222,7 +236,7 @@ jest.mock('../backend/src/services/currencyConversionService', () => ({
 }));
 
 jest.mock('../backend/src/config/stellarConfig', () => ({
-  SCHOOL_WALLET: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+  SCHOOL_WALLET: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
   ACCEPTED_ASSETS: {
     XLM:  { code: 'XLM',  type: 'native',          issuer: null },
     USDC: { code: 'USDC', type: 'credit_alphanum4', issuer: 'GISSUER' },
@@ -451,9 +465,10 @@ describe('Payment API', () => {
   // #605 — sync lock tests
   describe('POST /api/payments/sync — concurrent lock', () => {
     beforeEach(() => {
-      // Clear the in-memory lock set between tests by accessing it via the controller module
-      const ctrl = require('../backend/src/controllers/paymentController');
-      if (ctrl._syncLocks) ctrl._syncLocks.clear();
+      // Issue #69 replaced the in-process _syncLocks Set with the distributedLock
+      // service. Reset its in-process fallback store so a lock held by a prior test
+      // (e.g. the never-resolving-sync case) doesn't leak a 409 into later tests.
+      require('../backend/src/services/distributedLock')._resetLocalLocks();
     });
 
     afterEach(async () => {
@@ -529,6 +544,22 @@ describe('Payment API', () => {
     const etag = first.headers['etag'];
     const second = await testApi.get('/api/payments/accepted-assets').set('If-None-Match', etag);
     expect(second.status).toBe(304);
+  });
+
+  test('GET /api/payments/ — excludes soft-deleted payments', async () => {
+    const Payment = require('../backend/src/models/paymentModel');
+    Payment.find.mockClear();
+    Payment.countDocuments.mockClear();
+
+    const res = await testApi.get('/api/payments/');
+    expect(res.status).toBe(200);
+
+    // Assert the query filter includes deletedAt: null
+    const findCallArgs = Payment.find.mock.calls[0][0];
+    expect(findCallArgs).toHaveProperty('deletedAt', null);
+
+    const countCallArgs = Payment.countDocuments.mock.calls[0][0];
+    expect(countCallArgs).toHaveProperty('deletedAt', null);
   });
 });
 
@@ -653,6 +684,8 @@ describe('Duplicate Student Detection', () => {
 
   test('POST /api/students — 201 without warning for unique student', async () => {
     const Student = require('../backend/src/models/studentModel');
+    const FeeStructure = require('../backend/src/models/feeStructureModel');
+    FeeStructure.findOne.mockResolvedValueOnce({ className: '7A', feeAmount: 300 });
     Student.findOne.mockResolvedValueOnce(null); // no exact match
     Student.findOne.mockResolvedValueOnce(null); // no soft-deleted match
     Student.findOne.mockResolvedValueOnce(null); // no fuzzy match
@@ -685,12 +718,14 @@ describe('Duplicate Student Detection', () => {
 // ─── Idempotency ──────────────────────────────────────────────────────────────
 
 describe('Idempotency', () => {
-  let IdempotencyKey;
+  let store;
 
   beforeEach(() => {
-    IdempotencyKey = require('../backend/src/models/idempotencyKeyModel');
-    IdempotencyKey.findOne.mockResolvedValue(null);
-    IdempotencyKey.create.mockResolvedValue({});
+    store = require('../backend/src/services/idempotencyStore');
+    store.getFull.mockReset().mockResolvedValue(null);
+    store.reserve.mockReset().mockResolvedValue({ reserved: true });
+    store.complete.mockReset().mockResolvedValue(undefined);
+    store.release.mockReset().mockResolvedValue(undefined);
   });
 
   test('POST /api/payments/intent — 400 when Idempotency-Key header is missing', async () => {
@@ -707,11 +742,13 @@ describe('Idempotency', () => {
 
   test('POST /api/payments/intent — returns cached response on duplicate key', async () => {
     const cachedBody = { studentId: 'STU001', amount: 200, memo: 'CACHED1', status: 'pending' };
-    IdempotencyKey.findOne.mockResolvedValueOnce({
-      key: 'dupe-intent-key',
-      requestPath: '/intent',
+    store.getFull.mockResolvedValueOnce({
+      state: 'completed',
+      requestFingerprint: null,
       responseStatus: 201,
       responseBody: cachedBody,
+      scope: '/intent',
+      createdAt: new Date(),
     });
 
     const PaymentIntent = require('../backend/src/models/paymentIntentModel');
@@ -723,16 +760,20 @@ describe('Idempotency', () => {
 
     expect(res.status).toBe(201);
     expect(res.body).toEqual(cachedBody);
+    // Replay short-circuits before the handler runs, so no reservation or intent.
+    expect(store.reserve).not.toHaveBeenCalled();
     expect(PaymentIntent.create).not.toHaveBeenCalled();
   });
 
   test('POST /api/payments/verify — returns cached response on duplicate key', async () => {
     const cachedBody = { hash: 'abc123', memo: 'STU001', amount: 200, feeValidation: { status: 'valid' } };
-    IdempotencyKey.findOne.mockResolvedValueOnce({
-      key: 'dupe-verify-key',
-      requestPath: '/verify',
+    store.getFull.mockResolvedValueOnce({
+      state: 'completed',
+      requestFingerprint: null,
       responseStatus: 200,
       responseBody: cachedBody,
+      scope: '/verify',
+      createdAt: new Date(),
     });
 
     const res = await testApi.post('/api/payments/verify')
@@ -741,19 +782,20 @@ describe('Idempotency', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(cachedBody);
+    expect(store.reserve).not.toHaveBeenCalled();
   });
 
   test('POST /api/payments/intent — caches response after first successful call', async () => {
-    IdempotencyKey.create.mockClear();
-
     await testApi.post('/api/payments/intent')
       .set('Idempotency-Key', 'new-intent-key')
       .send({ studentId: MOCK_STUDENT_OBJ_ID });
 
-    expect(IdempotencyKey.create).toHaveBeenCalledWith(
+    // On a fresh key the middleware reserves, then persists the 201 response via
+    // complete(). The key is the canonical (path-scoped) derivation of the header.
+    expect(store.complete).toHaveBeenCalledWith(
+      expect.any(String),
       expect.objectContaining({
-        key: 'new-intent-key',
-        requestPath: '/intent',
+        scope: '/intent',
         responseStatus: 201,
       })
     );

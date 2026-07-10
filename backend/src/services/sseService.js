@@ -22,6 +22,7 @@
 
 const Redis = require('ioredis');
 const logger = require('../utils/logger').child('SSEService');
+const { getRedisConnectionOptions } = require('../config/redisClient');
 
 // Map of schoolId -> Set of SSE response objects (process-local)
 const clients = new Map();
@@ -37,14 +38,10 @@ const MAX_CONNECTIONS_PER_SCHOOL =
 // cannot issue regular commands such as PUBLISH.
 const redisEnabled = Boolean(process.env.REDIS_HOST);
 
-const redisConfig = {
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT, 10) || 6379,
-  password: process.env.REDIS_PASSWORD || undefined,
-  lazyConnect: true,
-  maxRetriesPerRequest: null,
-  enableOfflineQueue: false,
-};
+// Shared reconnection policy (Issue #83). pub/sub connections need
+// maxRetriesPerRequest: null so a blocking SUBSCRIBE survives a reconnect; on a
+// total outage emit() degrades to local fan-out (see emit() below).
+const redisConfig = getRedisConnectionOptions({ maxRetriesPerRequest: null });
 
 let publisher = null;
 let subscriber = null;
@@ -127,6 +124,14 @@ function addClient(schoolId, res) {
   }, HEARTBEAT_MS);
   if (typeof res._sseHeartbeat.unref === 'function') res._sseHeartbeat.unref();
 
+  // Self-clean when the underlying connection closes so a dropped client is
+  // never broadcast to again. Idempotent with any req.on('close') the caller
+  // (e.g. the SSE controller) may also register — removeClient is a no-op the
+  // second time.
+  if (typeof res.on === 'function') {
+    res.on('close', () => removeClient(schoolId, res));
+  }
+
   return true;
 }
 
@@ -154,6 +159,12 @@ function fanout(schoolId, event, data) {
   const set = clients.get(schoolId);
   if (!set || set.size === 0) return;
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  logger.debug('SSE event fanned out', {
+    schoolId,
+    event,
+    correlationId: data?.correlationId || null,
+    connections: set.size,
+  });
   for (const res of set) {
     try {
       res.write(payload);
@@ -169,23 +180,33 @@ function fanout(schoolId, event, data) {
  * With Redis enabled the event is published and every replica (including this
  * one) fans out via its subscriber — so we must NOT also fan out locally here,
  * or this replica would deliver twice.
+ *
+ * @param {string} schoolId
+ * @param {string} event
+ * @param {object} data
+ * @param {string} [correlationId] - Optional correlation ID to include in the payload
  */
-function emit(schoolId, event, data) {
+function emit(schoolId, event, data, correlationId) {
+  const enrichedData = correlationId
+    ? { ...data, correlationId }
+    : data;
+
   if (publisher) {
     publisher
-      .publish(`${CHANNEL_PREFIX}${schoolId}`, JSON.stringify({ event, data }))
+      .publish(`${CHANNEL_PREFIX}${schoolId}`, JSON.stringify({ event, data: enrichedData }))
       .catch((err) => {
         // Best-effort fallback so a transient publish failure still reaches
         // clients on this replica.
         logger.error('SSE publish failed — falling back to local fanout', {
           error: err.message,
           schoolId,
+          correlationId: correlationId || enrichedData?.correlationId || null,
         });
-        fanout(schoolId, event, data);
+        fanout(schoolId, event, enrichedData);
       });
     return;
   }
-  fanout(schoolId, event, data);
+  fanout(schoolId, event, enrichedData);
 }
 
 /**
@@ -195,6 +216,30 @@ function getStats() {
   let connections = 0;
   for (const set of clients.values()) connections += set.size;
   return { schools: clients.size, connections };
+}
+
+/**
+ * Close all SSE connections with a close/retry event so clients reconnect.
+ * Called during graceful shutdown to notify clients to reconnect.
+ */
+async function closeAll() {
+  const payload = 'event: retry\ndata: {"retry": true}\n\n';
+  let closed = 0;
+  for (const [schoolId, set] of clients) {
+    for (const res of set) {
+      try {
+        res.write(payload);
+        if (res._sseHeartbeat) {
+          clearInterval(res._sseHeartbeat);
+          res._sseHeartbeat = null;
+        }
+      } catch {
+        // ignore write errors during shutdown
+      }
+    }
+    closed += set.size;
+  }
+  logger.info('[SSEService] Sent close/retry to all clients', { connections: closed });
 }
 
 /**
@@ -215,6 +260,7 @@ module.exports = {
   emit,
   getStats,
   close,
+  closeAll,
   MAX_CONNECTIONS_PER_SCHOOL,
   // Exposed for testing
   _fanout: fanout,

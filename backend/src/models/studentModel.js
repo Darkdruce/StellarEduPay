@@ -2,6 +2,7 @@
 
 const mongoose = require('mongoose');
 const softDelete = require('../utils/softDelete');
+const tenantScope = require('../plugins/tenantScope');
 
 const feeCategorySchema = new mongoose.Schema(
   {
@@ -37,6 +38,24 @@ const studentSchema = new mongoose.Schema(
     lastReminderSentAt: { type: Date, default: null },
     reminderCount: { type: Number, default: 0 },
     reminderOptOut: { type: Boolean, default: false },
+    parentEmailSuppressed: { type: Boolean, default: false },
+    parentEmailSuppressionReason: { type: String, default: null },
+    parentEmailSuppressedAt: { type: Date, default: null },
+    lastEmailDeliveryStatus: { type: String, enum: ['queued', 'sent', 'failed', 'delivered', 'opened', 'bounced', 'complaint', 'skipped'], default: null },
+    lastEmailDeliveryAt: { type: Date, default: null },
+
+    /**
+     * Academic period to which the current reminderCount applies.
+     * Reset reminderCount when a new fee period begins (e.g. "2025-2026").
+     * Prevents a perpetually-unpaid fee from generating endless reminders
+     * across multiple academic years.
+     */
+    reminderPeriod: { type: String, default: null },
+
+    // Dispute hold — set to true when an active dispute is opened for this
+    // student's payment. Suppresses automated reminders and downstream
+    // automation until the dispute is resolved or rejected.
+    disputeHold: { type: Boolean, default: false, index: true },
 
     // Audit fields
     dateOfBirth: { type: Date },
@@ -61,6 +80,7 @@ const studentSchema = new mongoose.Schema(
 
 // Apply soft delete utility
 softDelete(studentSchema);
+studentSchema.plugin(tenantScope, { modelName: 'Student' });
 
 // isOverdue: true when a deadline is set, the fee is unpaid, and the deadline has passed
 studentSchema.virtual('isOverdue').get(function () {
@@ -115,7 +135,8 @@ studentSchema.pre('save', async function () {
       );
     } catch (archiveErr) {
       // Log but don't abort the save — active record integrity takes priority.
-      console.error('[StudentModel] Failed to archive fee history:', archiveErr.message);
+      const logger = require('../utils/logger').child('StudentModel');
+      logger.error('Failed to archive fee history', { error: archiveErr.message });
     }
   }
 

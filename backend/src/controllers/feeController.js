@@ -1,5 +1,6 @@
 'use strict';
 
+const mongoose = require('mongoose');
 const FeeStructure = require('../models/feeStructureModel');
 const { get, set, del, KEYS, TTL } = require('../cache');
 const { logAudit } = require('../services/auditService');
@@ -97,13 +98,67 @@ async function updateFeeStructure(req, res, next) {
     let studentsUpdated = 0;
     if (cascadeToStudents === true) {
       const Student = require('../models/studentModel');
-      const students = await Student.find({ schoolId: req.schoolId, class: className, deletedAt: null });
-      for (const s of students) {
-        s.feeAmount = feeAmount;
-        s.remainingBalance = Math.max(0, feeAmount - (s.totalPaid || 0));
-        s.feePaid = (s.totalPaid || 0) >= feeAmount;
-        await s.save();
-        studentsUpdated++;
+      const Payment = require('../models/paymentModel');
+      const StudentFeeHistory = require('../models/studentFeeHistoryModel');
+
+      const session = await mongoose.connection.startSession({
+        causalConsistency: true,
+      });
+      try {
+        await session.withTransaction(async () => {
+          const students = await Student.find({ schoolId: req.schoolId, class: className, deletedAt: null }).session(session);
+
+          if (students.length > 0) {
+            const studentIds = students.map(s => s.studentId);
+
+            // Aggregate confirmed payment totals per student from authoritative source
+            const paymentTotals = await Payment.aggregate([
+              { $match: { schoolId: req.schoolId, studentId: { $in: studentIds }, status: 'SUCCESS' } },
+              { $group: { _id: '$studentId', amountPaid: { $sum: '$amount' } } },
+            ]).session(session);
+
+            const paidByStudentId = new Map(paymentTotals.map(p => [p._id, p.amountPaid]));
+
+            const bulkOps = students.map(s => {
+              const amountPaid = paidByStudentId.get(s.studentId) || 0;
+              const remainingBalance = Math.max(0, feeAmount - amountPaid);
+              return {
+                updateOne: {
+                  filter: { _id: s._id, schoolId: req.schoolId },
+                  update: {
+                    $set: {
+                      feeAmount,
+                      totalPaid: amountPaid,
+                      remainingBalance,
+                      feePaid: amountPaid >= feeAmount,
+                    },
+                  },
+                },
+              };
+            });
+
+            await Student.bulkWrite(bulkOps, { session, writeConcern: { w: 'majority' } });
+
+            const historyDocs = students.map(s => {
+              const amountPaid = paidByStudentId.get(s.studentId) || 0;
+              const remainingBalance = Math.max(0, feeAmount - amountPaid);
+              return {
+                schoolId: req.schoolId,
+                studentId: s.studentId,
+                category: className,
+                amount: feeAmount,
+                paid: amountPaid >= feeAmount,
+                totalPaid: amountPaid,
+                remainingBalance,
+              };
+            });
+
+            await StudentFeeHistory.insertMany(historyDocs, { session, writeConcern: { w: 'majority' } });
+            studentsUpdated = students.length;
+          }
+        });
+      } finally {
+        session.endSession();
       }
     }
 

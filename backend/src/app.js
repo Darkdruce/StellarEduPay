@@ -29,19 +29,31 @@ const disputeRoutes = require('./routes/disputeRoutes');
 const sourceValidationRuleRoutes = require('./routes/sourceValidationRuleRoutes');
 const receiptsRoutes = require('./routes/receiptsRoutes');
 const feeAdjustmentRoutes = require('./routes/feeAdjustmentRoutes');
+const emailDeliveryRoutes = require('./routes/emailDeliveryRoutes');
+const emailProviderWebhookRoutes = require('./routes/emailProviderWebhookRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const authRoutes = require('./routes/authRoutes');
+const emailRoutes = require('./routes/emailRoutes');
 const metricsRoute = require('./routes/metricsRoute');
+const webhookEndpointRoutes = require('./routes/webhookEndpointRoutes');
+const webhookDeliveryRoutes = require('./routes/webhookDeliveryRoutes');
 
 const { registerPaymentSavedSubscribers } = require('./services/paymentSavedSubscribers');
 const { startPolling, stopPolling } = require('./services/transactionPollingService');
 const retrySelector = require('./services/retryServiceSelector');
-const { startConsistencyScheduler } = require('./services/consistencyScheduler');
+const { startConsistencyScheduler, stopConsistencyScheduler } = require('./services/consistencyScheduler');
 const { startReminderScheduler, stopReminderScheduler } = require('./services/reminderService');
 const { startWorker: startTxQueueWorker, stopWorker: stopTxQueueWorker } = require('./services/transactionQueueService');
 const { startSessionCleanupScheduler, stopSessionCleanupScheduler } = require('./services/sessionCleanupService');
 const { startReconciliationScheduler, stopReconciliationScheduler } = require('./services/reconciliationService');
+const { startStuckPaymentReconciliationScheduler, stopStuckPaymentReconciliationScheduler } = require('./services/stuckPaymentReconciliation');
 const { startAuditLogCleanupScheduler, stopAuditLogCleanupScheduler } = require('./services/auditLogCleanupService');
+const { startMetricsRollupScheduler, stopMetricsRollupScheduler } = require('./services/metricsRollupService');
+const { startWebhookRetryScheduler, stopWebhookRetryScheduler } = require('./services/webhookRetryScheduler');
+const { startOutboxDispatcher, stopOutboxDispatcher } = require('./services/outboxDispatcher');
+const { startReconciliationReportScheduler, stopReconciliationReportScheduler } = require('./services/reconciliationReportScheduler');
+const { startWorker: startReportQueueWorker, stopWorker: stopReportQueueWorker } = require('./services/reportQueueService');
+const { close: closeReportCacheInvalidator } = require('./services/reportCacheInvalidator');
 const { closeQueue } = require('./queue/transactionQueue');
 const bullMQRetryService = require('./services/bullMQRetryService');
 const { initializeRetryQueue, setupMonitoring } = require('./config/retryQueueSetup');
@@ -49,8 +61,10 @@ const { notFoundHandler, globalErrorHandler } = require('./middleware/errorHandl
 const { requestLogger } = require('./middleware/requestLogger');
 const { createConcurrentRequestMiddleware } = require('./middleware/concurrentRequestHandler');
 const { requireAdminAuth } = require('./middleware/auth');
+const { jsonDepthGuard, deduplicateQueryParams } = require('./middleware/sanitizeRequest');
 const { runConsistencyCheck } = require('./controllers/consistencyController');
-const { healthCheck } = require('./controllers/healthController');
+const { healthCheck, healthLive, healthReady } = require('./controllers/healthController');
+const { setupEnforceConsoleErrorLogging } = require('./errorHandling');
 const logger = require('./utils/logger');
 const { startHeapMonitoring } = require('./utils/heapMonitoring');
 
@@ -89,8 +103,29 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
-app.use(express.json({ limit: config.MAX_BODY_SIZE }));
+app.use(express.json({
+  limit: config.MAX_BODY_SIZE,
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  },
+}));
 app.use(requestLogger());
+
+// ── Cache-Control: no-store on auth and sensitive data routes ─────────────────
+// Prevents intermediaries (CDNs, shared proxies) from caching tokens,
+// payment data, audit logs, and other sensitive JSON responses.
+const SENSITIVE_PATH_RE = /^\/api\/(auth|payments|students|reports|audit|receipts|disputes|fee-adjustments|payment-plans|reminders|webhook-endpoints|webhook-deliveries)\b/;
+app.use((req, res, next) => {
+  if (SENSITIVE_PATH_RE.test(req.path)) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+  }
+  next();
+});
+
+// ── JSON depth / array-bomb guard + query-param de-pollution ──────────────────
+app.use(jsonDepthGuard);
+app.use(deduplicateQueryParams);
 
 const concurrentMiddleware = createConcurrentRequestMiddleware({
   circuitBreaker: { failureThreshold: 5, resetTimeoutMs: 30000, halfOpenSuccessThreshold: 2 },
@@ -105,6 +140,12 @@ app.use('/metrics', metricsRoute);
 app.use(concurrentMiddleware.rateLimiter((req) => req.ip));
 app.use(concurrentMiddleware.requestQueue());
 
+// ── Maintenance mode ───────────────────────────────────────────────────────────
+// Global maintenance mode check. Per-school maintenance mode is enforced inside
+// schoolContext.js after tenant resolution.
+const { maintenanceMode } = require('./middleware/maintenanceMode');
+app.use(maintenanceMode);
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api/schools', schoolRoutes);
 app.use('/api/students', studentRoutes);
@@ -116,10 +157,17 @@ app.use('/api/disputes', disputeRoutes);
 app.use('/api/source-rules', sourceValidationRuleRoutes);
 app.use('/api/receipts', receiptsRoutes);
 app.use('/api/fee-adjustments', feeAdjustmentRoutes);
+app.use('/api/email-deliveries', emailDeliveryRoutes);
+app.use('/api/email-provider-webhook', emailProviderWebhookRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/webhook-endpoints', webhookEndpointRoutes);
+app.use('/api/webhook-deliveries', webhookDeliveryRoutes);
+app.use('/api/email', emailRoutes);
 app.get('/api/consistency', requireAdminAuth, runConsistencyCheck);
 app.get('/health', healthCheck);
+app.get('/health/live', healthLive);
+app.get('/health/ready', healthReady);
 
 // Issue #671: OpenAPI/Swagger documentation
 try {
@@ -147,39 +195,11 @@ app.use(notFoundHandler);
 app.use(globalErrorHandler);
 
 // ── Database + service startup ────────────────────────────────────────────────
-async function connectWithRetry(maxAttempts = 5, baseDelayMs = 1000) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      await mongoose.connect(config.MONGO_URI);
-      logger.info('MongoDB connected');
-      return;
-    } catch (err) {
-      const delay = baseDelayMs * Math.pow(2, attempt - 1); // exponential backoff
-      logger.error(`MongoDB connection attempt ${attempt}/${maxAttempts} failed`, {
-        error: err.message,
-        retryInMs: attempt < maxAttempts ? delay : null,
-      });
-      if (attempt === maxAttempts) {
-        logger.error('Exhausted all MongoDB connection attempts — exiting');
-        process.exit(1);
-      }
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-}
+const { connect: connectDatabase } = require('./config/database');
+// Connection options are configured in config/database.js with explicit pool sizing,
+// timeouts, and majority write concern for financial data durability.
 
-// Log disconnections after successful startup
-mongoose.connection.on('disconnected', () =>
-  logger.warn('MongoDB disconnected — waiting for reconnect')
-);
-mongoose.connection.on('reconnected', () =>
-  logger.info('MongoDB reconnected')
-);
-mongoose.connection.on('error', (err) =>
-  logger.error('MongoDB connection error', { error: err.message })
-);
-
-connectWithRetry().then(async () => {
+connectDatabase().then(async () => {
   // Start heap monitoring to detect memory leaks early
   startHeapMonitoring();
 
@@ -206,15 +226,56 @@ connectWithRetry().then(async () => {
     logger.error('Stuck payment reconciliation failed on startup', { error: err.message });
   }
 
-  startPolling();
-  startConsistencyScheduler();
-  retrySelector.start();
-  startTxQueueWorker();
-  startReminderScheduler();
-  startSessionCleanupScheduler();
-  startReconciliationScheduler();
-  startAuditLogCleanupScheduler();
-  registerPaymentSavedSubscribers();
+  // Recover any pending/processing BullMQ jobs that survived a restart in MongoDB
+  const { recoverPendingJobs } = require('./queue/transactionQueue');
+  try {
+    await recoverPendingJobs();
+  } catch (err) {
+    logger.error('Transaction queue recovery failed on startup', { error: err.message });
+  }
+
+  // ── Leader election for singleton schedulers ───────────────────────────────
+  // Polling uses per-school distributed locks; the transaction queue worker
+  // and retry selector are safe for multi-instance.  All other schedulers run
+  // only on the elected leader to prevent N× concurrent execution when scaled.
+  const leaderElection = require('./services/leaderElection');
+
+  const startLeaderSchedulers = () => {
+    logger.info('[Leader] Starting leader-only schedulers');
+    startConsistencyScheduler();
+    startReminderScheduler();
+    startSessionCleanupScheduler();
+    startReconciliationScheduler();
+    startStuckPaymentReconciliationScheduler();
+    startAuditLogCleanupScheduler();
+    startWebhookRetryScheduler();
+    startReconciliationReportScheduler();
+    startMetricsRollupScheduler();
+  };
+
+  const stopLeaderSchedulers = () => {
+    logger.info('[Leader] Stopping leader-only schedulers');
+    stopConsistencyScheduler();
+    stopReminderScheduler();
+    stopSessionCleanupScheduler();
+    stopReconciliationScheduler();
+    stopStuckPaymentReconciliationScheduler();
+    stopAuditLogCleanupScheduler();
+    stopWebhookRetryScheduler();
+    stopReconciliationReportScheduler();
+    stopMetricsRollupScheduler();
+  };
+
+  leaderElection.register(startLeaderSchedulers, stopLeaderSchedulers);
+  await leaderElection.start();
+
+// Always-start services (handle concurrency internally)
+   startPolling();
+   retrySelector.start();
+   startTxQueueWorker();
+   registerPaymentSavedSubscribers();
+   startOutboxDispatcher();
+   startReportQueueWorker();
 
   // Only initialise BullMQ when Redis is configured
   if (retrySelector.useBullMQ()) {
@@ -236,6 +297,18 @@ connectWithRetry().then(async () => {
     logger.warn('REDIS_HOST is not configured — using MongoDB retry backend. Rate-limit counters are in-process only and will reset on restart. Set REDIS_HOST for production deployments.');
     logger.info('All services initialized successfully (MongoDB retry backend)');
   }
+}).catch((err) => {
+  // A permanent DB-connection or startup-initialization failure must never
+  // become an unhandled promise rejection (which crashes the process abruptly
+  // and, under Jest, kills the whole test run). Log it, and in a real runtime
+  // exit non-zero so the orchestrator restarts us. Under tests there is no live
+  // database, so we simply log and let the suite continue with mocked models.
+  logger.error('[Startup] Database connection or service initialization failed', {
+    error: err.message,
+  });
+  if (process.env.NODE_ENV !== 'test' && !process.env.JEST_WORKER_ID) {
+    process.exit(1);
+  }
 });
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -245,36 +318,42 @@ const server = require.main === module
   : { close: (cb) => cb && cb() };
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
+const {
+  setReady,
+  isReady,
+  isShutdownInProgress,
+  drainWorkers,
+  notifySSEClients,
+  closeQueues,
+  stopAcceptingNewWork,
+} = require('./services/shutdownManager');
+
 async function shutdown(signal) {
+  if (isShutdownInProgress()) {
+    logger.warn('Shutdown already in progress — ignoring duplicate signal');
+    return;
+  }
+
   logger.info(`Received ${signal} signal — starting graceful shutdown`);
+
+  setReady(false);
 
   const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 30_000;
 
-  // Stop background services — no new work accepted
-  stopPolling();
-  retrySelector.stop();
-  stopReminderScheduler();
-  stopSessionCleanupScheduler();
-  stopReconciliationScheduler();
-  stopAuditLogCleanupScheduler();
-
-  try {
-    await stopTxQueueWorker();
-    await closeQueue();
-    await bullMQRetryService.shutdownQueue();
-    await require('./services/sseService').close();
-    await require('./services/distributedLock').close();
-    logger.info('BullMQ resources closed cleanly');
-  } catch (err) {
-    logger.error('Error closing BullMQ resources during shutdown', { error: err.message });
-  }
-
-  // Force exit after SHUTDOWN_TIMEOUT_MS regardless of in-flight requests
   const forceExitTimer = setTimeout(() => {
     logger.error(`Forced exit after ${SHUTDOWN_TIMEOUT_MS}ms shutdown timeout`);
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
-  forceExitTimer.unref(); // don't keep the event loop alive just for this timer
+  forceExitTimer.unref();
+
+  try {
+    await stopAcceptingNewWork();
+    await drainWorkers();
+    await notifySSEClients();
+    await closeQueues();
+  } catch (err) {
+    logger.error('Error during shutdown', { error: err.message });
+  }
 
   // (1) Stop accepting new connections; (2) wait for in-flight requests to finish;
   // (3) only then close the database connection.
@@ -295,4 +374,10 @@ async function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+setupEnforceConsoleErrorLogging();
+
+// Export the Express app as the default so `require('./app')` yields the app
+// directly (used by supertest and the server bootstrap). The shutdown readiness
+// probe is attached as a property for any consumer that needs it.
+app.isReady = isReady;
 module.exports = app;

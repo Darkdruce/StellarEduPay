@@ -9,6 +9,13 @@ const generalLimiter       = rl(15 * 60 * 1000, 100);
 const strictLimiter        = rl(15 * 60 * 1000, 10);
 const verifyLimiter        = rl(60 * 1000, parseInt(process.env.VERIFY_RATE_LIMIT || '10', 10));
 const reminderTriggerLimiter = rl(60 * 60 * 1000, 5, { error: 'Too many reminder requests. Please wait.', code: 'RATE_LIMIT_EXCEEDED' });
-const bulkImportLimiter    = rl(60 * 60 * 1000, 5, { error: 'Maximum 5 bulk imports per hour.', code: 'RATE_LIMIT_EXCEEDED' });
+const bulkImportLimiter    = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: parseInt(process.env.BULK_IMPORT_RATE_LIMIT, 10) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Maximum 5 bulk imports per hour.', code: 'RATE_LIMIT_EXCEEDED' },
+  keyGenerator: (req) => req.schoolId || 'unknown-tenant',
+});
 
 module.exports = { generalLimiter, strictLimiter, verifyLimiter, reminderTriggerLimiter, bulkImportLimiter };

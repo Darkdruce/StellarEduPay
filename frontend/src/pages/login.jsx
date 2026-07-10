@@ -2,6 +2,16 @@ import Head from 'next/head';
 import { useState } from 'react';
 import { useRouter } from 'next/router';
 import { useAdminAuth } from '../hooks/useAdminAuth';
+import { getErrorMessage } from '../utils/errorMessages';
+
+// Only honour same-origin, absolute internal paths as a post-login destination.
+// Anything else (external URLs, protocol-relative "//evil.com", missing) falls
+// back to the dashboard — prevents open-redirect via the returnTo query param.
+function safeReturnTo(returnTo) {
+  if (typeof returnTo !== 'string') return '/dashboard';
+  if (!returnTo.startsWith('/') || returnTo.startsWith('//')) return '/dashboard';
+  return returnTo;
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -23,9 +33,9 @@ export default function LoginPage() {
         body: JSON.stringify({ username, password }),
       });
       const data = await res.json();
-      if (!res.ok) { setError(data.error || 'Login failed.'); return; }
+      if (!res.ok) { setError(getErrorMessage(data.code, data.error)); return; }
       login();
-      router.push('/dashboard');
+      router.push(safeReturnTo(router.query.returnTo));
     } catch {
       setError('Network error. Please try again.');
     } finally {
@@ -40,7 +50,7 @@ export default function LoginPage() {
         .login-page {
           min-height: calc(100vh - 60px);
           background:
-            radial-gradient(700px 400px at 50% -10%, rgba(139,92,246,0.16), transparent 60%),
+            radial-gradient(700px 400px at 50% -10%, rgba(5,150,105,0.16), transparent 60%),
             radial-gradient(600px 350px at 100% 100%, rgba(6,182,212,0.12), transparent 55%),
             #f6f7fb;
           display: flex;
@@ -60,12 +70,12 @@ export default function LoginPage() {
         }
         .login-icon {
           width: 56px; height: 56px;
-          background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+          background: linear-gradient(135deg, #059669 0%, #0d9488 100%);
           border-radius: 16px;
           display: flex; align-items: center; justify-content: center;
           font-size: 1.4rem;
           margin: 0 auto 1.5rem;
-          box-shadow: 0 12px 28px -8px rgba(99,102,241,0.6);
+          box-shadow: 0 12px 28px -8px rgba(5,150,105,0.6);
         }
         .login-card h1 {
           font-size: 1.5rem !important;
@@ -102,8 +112,8 @@ export default function LoginPage() {
           font-family: inherit;
         }
         .login-input:focus {
-          border-color: #6366f1;
-          box-shadow: 0 0 0 4px rgba(99,102,241,0.18);
+          border-color: #059669;
+          box-shadow: 0 0 0 4px rgba(5,150,105,0.18);
           background: #fff;
         }
         .login-error {
@@ -118,7 +128,7 @@ export default function LoginPage() {
         }
         .login-btn {
           width: 100%;
-          background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+          background: linear-gradient(135deg, #059669 0%, #0d9488 100%);
           color: #fff;
           border: none;
           border-radius: 10px;
@@ -128,11 +138,22 @@ export default function LoginPage() {
           transition: filter 0.15s, transform 0.1s, box-shadow 0.15s;
           margin-top: 0.5rem;
           letter-spacing: -0.01em;
-          box-shadow: 0 10px 24px -8px rgba(99,102,241,0.6);
+          box-shadow: 0 10px 24px -8px rgba(5,150,105,0.6);
         }
         .login-btn:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
         .login-btn:active:not(:disabled) { transform: scale(0.99); }
         .login-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+        .login-btn-inner { display: flex; align-items: center; justify-content: center; gap: 0.5rem; }
+        .login-spinner {
+          width: 1em; height: 1em;
+          border: 2px solid rgba(255,255,255,0.4);
+          border-top-color: #fff;
+          border-radius: 50%;
+          animation: spin 0.7s linear infinite;
+          flex-shrink: 0;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .login-input:disabled { opacity: 0.6; cursor: not-allowed; }
         .login-footer {
           text-align: center;
           margin-top: 1.5rem;
@@ -147,12 +168,12 @@ export default function LoginPage() {
         html.dark .login-label { color: #94a3b8; }
         html.dark .login-page {
           background:
-            radial-gradient(700px 400px at 50% -10%, rgba(139,92,246,0.2), transparent 60%),
+            radial-gradient(700px 400px at 50% -10%, rgba(5,150,105,0.2), transparent 60%),
             radial-gradient(600px 350px at 100% 100%, rgba(6,182,212,0.14), transparent 55%),
             #0a0e1f;
         }
         html.dark .login-input { background: #0a0e1f; border-color: #25304d; color: #f1f5f9; }
-        html.dark .login-input:focus { border-color: #818cf8; background: #0a0e1f; box-shadow: 0 0 0 4px rgba(129,140,248,0.22); }
+        html.dark .login-input:focus { border-color: #34d399; background: #0a0e1f; box-shadow: 0 0 0 4px rgba(52,211,153,0.22); }
       `}</style>
 
       <div className="login-page">
@@ -174,6 +195,7 @@ export default function LoginPage() {
                 autoComplete="username"
                 autoFocus
                 placeholder="admin"
+                disabled={loading}
               />
             </div>
 
@@ -188,6 +210,7 @@ export default function LoginPage() {
                 required
                 autoComplete="current-password"
                 placeholder="••••••••"
+                disabled={loading}
               />
             </div>
 
@@ -197,8 +220,11 @@ export default function LoginPage() {
               </div>
             )}
 
-            <button className="login-btn" type="submit" disabled={loading}>
-              {loading ? 'Signing in…' : 'Sign in →'}
+            <button className="login-btn" type="submit" disabled={loading} aria-busy={loading}>
+              <span className="login-btn-inner">
+                {loading && <span className="login-spinner" aria-hidden="true" />}
+                {loading ? 'Signing in…' : 'Sign in →'}
+              </span>
             </button>
           </form>
 

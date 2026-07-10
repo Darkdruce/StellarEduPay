@@ -1,7 +1,7 @@
 'use strict';
 
 process.env.MONGO_URI = 'mongodb://localhost:27017/test';
-process.env.SCHOOL_WALLET_ADDRESS = 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B';
+process.env.SCHOOL_WALLET_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 process.env.JWT_SECRET = 'test-secret';
 
 const request = require('supertest');
@@ -17,7 +17,13 @@ jest.mock('mongoose', () => ({
 jest.mock('../backend/src/models/studentModel', () => ({
   create: jest.fn(),
   find: jest.fn().mockReturnValue({ sort: jest.fn().mockReturnValue({ skip: jest.fn().mockReturnValue({ limit: jest.fn().mockResolvedValue([]) }) }) }),
-  findOne: jest.fn().mockResolvedValue(null),
+  // findOne must support both `await findOne()` and `findOne().includeDeleted()/.lean()`.
+  findOne: jest.fn().mockImplementation(() => {
+    const p = Promise.resolve(null);
+    p.includeDeleted = () => Promise.resolve(null);
+    p.lean = () => Promise.resolve(null);
+    return p;
+  }),
   findOneAndUpdate: jest.fn().mockResolvedValue({}),
   countDocuments: jest.fn().mockResolvedValue(0),
   insertMany: jest.fn().mockResolvedValue([]),
@@ -29,7 +35,7 @@ jest.mock('../backend/src/models/schoolModel', () => ({
       schoolId: 'SCH001',
       name: 'Test School',
       slug: 'test-school',
-      stellarAddress: 'GCICZOP346CKADPWOZ6JAQ7OCGH44UELNS3GSDXFOTSZRW6OYZZ6KSY7B',
+      stellarAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
       localCurrency: 'USD',
       isActive: true,
       maxStudents: 10,
@@ -40,7 +46,10 @@ jest.mock('../backend/src/models/schoolModel', () => ({
 
 jest.mock('../backend/src/models/feeStructureModel', () => ({
   create: jest.fn().mockResolvedValue({}),
-  find: jest.fn().mockReturnValue({ sort: jest.fn().mockResolvedValue([]) }),
+  find: jest.fn().mockReturnValue({
+    sort: jest.fn().mockResolvedValue([]),
+    lean: jest.fn().mockResolvedValue([{ className: 'Grade 5A', feeAmount: 250, isActive: true }]),
+  }),
   findOne: jest.fn().mockResolvedValue({ feeAmount: 250 }),
   findOneAndUpdate: jest.fn().mockResolvedValue({}),
 }));
@@ -128,6 +137,12 @@ jest.mock('../backend/src/services/auditService', () => ({
   logAudit: jest.fn().mockResolvedValue(undefined),
 }));
 
+jest.mock('../backend/src/middleware/auth', () => ({
+  requireAdminAuth: (req, res, next) => next(),
+  requireAuth: (req, res, next) => next(),
+  requireSchoolAuth: () => (req, res, next) => next(),
+}));
+
 const app = require('../backend/src/app');
 
 const SCHOOL_HEADERS = { 'X-School-ID': 'SCH001' };
@@ -149,8 +164,8 @@ describe('Student Quota (#680)', () => {
     test('201 — creates student when under quota', async () => {
       Student.countDocuments.mockResolvedValueOnce(5);
       Student.findOne.mockResolvedValueOnce(null);
-      School.findOne.mockReturnValueOnce({
-        lean: jest.fn().mockResolvedValueOnce({ schoolId: 'SCH001', maxStudents: 10 }),
+      School.findOne.mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ schoolId: 'SCH001', maxStudents: 10, isActive: true }),
       });
       Student.create.mockResolvedValueOnce({
         studentId: 'STU001',
@@ -173,8 +188,8 @@ describe('Student Quota (#680)', () => {
     test('403 — rejects when at quota', async () => {
       Student.countDocuments.mockResolvedValueOnce(10);
       Student.findOne.mockResolvedValueOnce(null);
-      School.findOne.mockReturnValueOnce({
-        lean: jest.fn().mockResolvedValueOnce({ schoolId: 'SCH001', maxStudents: 10 }),
+      School.findOne.mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ schoolId: 'SCH001', maxStudents: 10, isActive: true }),
       });
 
       const res = await api('post', '/api/students').send({
@@ -184,14 +199,14 @@ describe('Student Quota (#680)', () => {
       });
 
       expect(res.status).toBe(403);
-      expect(res.body.code).toBe('STUDENT_QUOTA_EXCEEDED');
+      expect(res.body.error.code).toBe('STUDENT_QUOTA_EXCEEDED');
     });
 
     test('403 — rejects when exceeding quota', async () => {
       Student.countDocuments.mockResolvedValueOnce(15);
       Student.findOne.mockResolvedValueOnce(null);
-      School.findOne.mockReturnValueOnce({
-        lean: jest.fn().mockResolvedValueOnce({ schoolId: 'SCH001', maxStudents: 10 }),
+      School.findOne.mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ schoolId: 'SCH001', maxStudents: 10, isActive: true }),
       });
 
       const res = await api('post', '/api/students').send({
@@ -201,15 +216,15 @@ describe('Student Quota (#680)', () => {
       });
 
       expect(res.status).toBe(403);
-      expect(res.body.code).toBe('STUDENT_QUOTA_EXCEEDED');
+      expect(res.body.error.code).toBe('STUDENT_QUOTA_EXCEEDED');
     });
   });
 
   describe('POST /api/students/bulk — bulk import', () => {
     test('201 — imports all students when under quota', async () => {
       Student.countDocuments.mockResolvedValueOnce(0);
-      School.findOne.mockReturnValueOnce({
-        lean: jest.fn().mockResolvedValueOnce({ schoolId: 'SCH001', maxStudents: 100 }),
+      School.findOne.mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ schoolId: 'SCH001', maxStudents: 100, isActive: true }),
       });
       Student.insertMany.mockResolvedValueOnce([
         { studentId: 'STU001', name: 'Alice', class: 'Grade 5A', feeAmount: 250 },
@@ -230,8 +245,8 @@ describe('Student Quota (#680)', () => {
 
     test('201 — partial import when spanning quota boundary', async () => {
       Student.countDocuments.mockResolvedValueOnce(8);
-      School.findOne.mockReturnValueOnce({
-        lean: jest.fn().mockResolvedValueOnce({ schoolId: 'SCH001', maxStudents: 10 }),
+      School.findOne.mockReturnValue({
+        lean: jest.fn().mockResolvedValue({ schoolId: 'SCH001', maxStudents: 10, isActive: true }),
       });
       Student.insertMany.mockResolvedValueOnce([
         { studentId: 'STU009', name: 'Alice', class: 'Grade 5A', feeAmount: 250 },

@@ -37,7 +37,14 @@ const {
   getQueueJobStatus,
   getStuckPayments,
   updatePaymentStatus,
+  reviewSuspiciousPayment,
   streamPaymentEvents,
+  initiatePaymentRefund,
+  getPaymentRefunds,
+  getSchoolRefunds,
+  verifyReceipt,
+  getReconciliationReports,
+  generateSchoolReconciliationReport,
 } = require('../controllers/paymentAdminController');
 
 const {
@@ -193,5 +200,15 @@ router.post("/:paymentId/lock", lockPaymentForUpdate);
 router.post("/:paymentId/unlock", unlockPayment);
 
 router.patch("/:txHash/status", requireAdminAuth, auditContext, updatePaymentStatus);
+router.patch("/:txHash/suspicion-review", requireAdminAuth, auditContext, reviewSuspiciousPayment);
+
+router.post("/:txHash/refund", requireAdminAuth, auditContext, initiatePaymentRefund);
+router.get("/:txHash/refunds", getPaymentRefunds);
+router.get("/refunds/school/list", requireAdminAuth, getSchoolRefunds);
+
+router.get("/verify/:receiptId", verifyReceipt);
+
+router.get("/reconciliation/reports", requireAdminAuth, getReconciliationReports);
+router.post("/reconciliation/report", requireAdminAuth, auditContext, generateSchoolReconciliationReport);
 
 module.exports = router;

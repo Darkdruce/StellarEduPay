@@ -67,6 +67,21 @@ const CONFIRMATION_THRESHOLD = parseInt(
   process.env.CONFIRMATION_THRESHOLD || "2",
   10,
 );
+
+// Finality threshold (issue #747): ledgers required beyond CONFIRMATION_THRESHOLD
+// before a payment is promoted from 'confirmed' to 'finalized' — the point at
+// which it is treated as practically irreversible and should never require
+// manual correction. Must be >= CONFIRMATION_THRESHOLD; defaults to 5x it.
+const FINALIZATION_THRESHOLD = parseInt(
+  process.env.FINALIZATION_THRESHOLD || String(CONFIRMATION_THRESHOLD * 5),
+  10,
+);
+if (FINALIZATION_THRESHOLD < CONFIRMATION_THRESHOLD) {
+  throw new Error(
+    "[Config] FINALIZATION_THRESHOLD must be >= CONFIRMATION_THRESHOLD.",
+  );
+}
+
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 
 // SYNC_INTERVAL_MS is the canonical env var for auto-sync interval.
@@ -97,6 +112,14 @@ const MAX_PAYMENT_AMOUNT = parseFloat(
 
 // ── Concurrent Payment Processor ─────────────────────────────────────────────
 const MAX_QUEUE_DEPTH = parseInt(process.env.MAX_QUEUE_DEPTH || "1000", 10);
+const QUEUE_BACKPRESSURE_HIGH_WATER = parseInt(
+  process.env.QUEUE_BACKPRESSURE_HIGH_WATER || String(Math.ceil(MAX_QUEUE_DEPTH * 0.8)),
+  10,
+);
+const QUEUE_BACKPRESSURE_LOW_WATER = parseInt(
+  process.env.QUEUE_BACKPRESSURE_LOW_WATER || String(Math.floor(MAX_QUEUE_DEPTH * 0.5)),
+  10,
+);
 
 if (MIN_PAYMENT_AMOUNT < 0) {
   throw new Error("[Config] MIN_PAYMENT_AMOUNT must be a positive number");
@@ -122,27 +145,33 @@ const STELLAR_TIMEOUT_MS = parseInt(
 );
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-// Secret used to sign/verify admin JWTs.
+// Secret used to sign/verify admin JWTs. Must be at least 32 characters.
 const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET) {
+const JWT_SECRET_MIN_LENGTH = 32;
+if (!JWT_SECRET || JWT_SECRET.length < JWT_SECRET_MIN_LENGTH) {
+  const reason = !JWT_SECRET
+    ? 'JWT_SECRET is not set'
+    : `JWT_SECRET is too short (${JWT_SECRET.length} chars; minimum ${JWT_SECRET_MIN_LENGTH})`;
   if (process.env.NODE_ENV === 'production') {
     throw new Error(
-      '[Config] JWT_SECRET is required in production. ' +
-      'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(64).toString(\'hex\'))"'
+      `[Config] ${reason}. ` +
+      "Generate a strong secret with: node -e \"console.log(require('crypto').randomBytes(64).toString('hex'))\""
     );
   } else {
     console.warn(
-      '[Config] WARNING: JWT_SECRET is not set. Admin authentication is non-functional. ' +
-      'Set JWT_SECRET in your .env file before deploying to production.'
+      `[Config] WARNING: ${reason}. Admin authentication is insecure. ` +
+      'Set a strong JWT_SECRET before deploying to production.'
     );
   }
 }
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "8h";
 
 // ── Fee Reminders ─────────────────────────────────────────────────────────────
-// How often the scheduler checks for unpaid fees (default: 24 hours)
+// How often the scheduler checks for unpaid fees (default: 1 hour).
+// Schools are only processed during their configured send window, so a shorter
+// interval ensures every school gets picked up at the right local time.
 const REMINDER_INTERVAL_MS = parseInt(
-  process.env.REMINDER_INTERVAL_MS || String(24 * 60 * 60 * 1000),
+  process.env.REMINDER_INTERVAL_MS || String(60 * 60 * 1000),
   10,
 );
 // Minimum hours between reminders for the same student (default: 48 hours)
@@ -161,8 +190,26 @@ const SMTP_USER = process.env.SMTP_USER || null;
 const SMTP_PASS = process.env.SMTP_PASS || null;
 const SMTP_FROM = process.env.SMTP_FROM || "noreply@stellaredupay.com";
 
+// Email provider inbound webhook secret
+const EMAIL_PROVIDER_WEBHOOK_SECRET = process.env.EMAIL_PROVIDER_WEBHOOK_SECRET || null;
+
+// Pluggable email provider (Issue #80): smtp | ses | sendgrid | console.
+// When unset the email module auto-selects smtp (if SMTP_* configured) else console.
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || null;
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || null;
+const AWS_REGION = process.env.AWS_REGION || null;
+
+// ── Twilio (SMS / WhatsApp) ────────────────────────────────────────────────
+// All Twilio variables are optional. When unset, smsService falls back to
+// console-log (dev mode) so the application starts without SMS credentials.
+const TWILIO_ACCOUNT_SID  = process.env.TWILIO_ACCOUNT_SID  || null;
+const TWILIO_AUTH_TOKEN   = process.env.TWILIO_AUTH_TOKEN   || null;
+const TWILIO_FROM_NUMBER  = process.env.TWILIO_FROM_NUMBER  || null;
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || null;
+
 // ── Freeze to prevent accidental mutation at runtime ─────────────────────────
 const config = Object.freeze({
+  EMAIL_PROVIDER_WEBHOOK_SECRET,
   PORT,
   MONGO_URI,
   STELLAR_NETWORK,
@@ -173,6 +220,7 @@ const config = Object.freeze({
   USDC_ISSUER,
   ACCEPTED_ASSET,
   CONFIRMATION_THRESHOLD,
+  FINALIZATION_THRESHOLD,
   POLL_INTERVAL_MS,
   SYNC_INTERVAL_MS,
   SYNC_LOCK_TTL_MS,
@@ -181,6 +229,8 @@ const config = Object.freeze({
   MIN_PAYMENT_AMOUNT,
   MAX_PAYMENT_AMOUNT,
   MAX_QUEUE_DEPTH,
+  QUEUE_BACKPRESSURE_HIGH_WATER,
+  QUEUE_BACKPRESSURE_LOW_WATER,
   MAX_BODY_SIZE,
   REQUEST_TIMEOUT_MS,
   STELLAR_TIMEOUT_MS,
@@ -195,6 +245,13 @@ const config = Object.freeze({
   SMTP_USER,
   SMTP_PASS,
   SMTP_FROM,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_FROM_NUMBER,
+  TWILIO_WHATSAPP_FROM,
+  EMAIL_PROVIDER,
+  SENDGRID_API_KEY,
+  AWS_REGION,
 });
 
 module.exports = config;

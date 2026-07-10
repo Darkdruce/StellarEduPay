@@ -53,9 +53,11 @@ describe('handleLogin', () => {
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'INVALID_CREDENTIALS' }));
   });
 
-  it('returns a token with role:admin for valid credentials', () => {
+  it('returns a token with role:admin for valid credentials', async () => {
     const res = mockRes();
-    handleLogin({ body: { username: 'admin', password: 'correct-password' } }, res);
+    // The success path is async now (#595 awaits issueRefreshToken before
+    // res.json), so the call must be awaited before asserting on res.
+    await handleLogin({ body: { username: 'admin', password: 'correct-password' } }, res);
     expect(res.status).not.toHaveBeenCalled();
     const [body] = res.json.mock.calls[0];
     // Token is now in the HttpOnly cookie, not the response body
@@ -81,14 +83,17 @@ describe('handleLogin', () => {
 });
 
 describe('config — JWT_SECRET enforcement', () => {
-  it('throws a clear error when JWT_SECRET is missing', () => {
-    const saved = process.env.JWT_SECRET;
+  it('throws a clear error when JWT_SECRET is missing in production', () => {
+    const savedSecret = process.env.JWT_SECRET;
+    const savedEnv = process.env.NODE_ENV;
     delete process.env.JWT_SECRET;
+    process.env.NODE_ENV = 'production';
     expect(() => {
       jest.isolateModules(() => {
         require('../backend/src/config/index.js');
       });
     }).toThrow(/JWT_SECRET/);
-    process.env.JWT_SECRET = saved;
+    process.env.JWT_SECRET = savedSecret;
+    process.env.NODE_ENV = savedEnv;
   });
 });

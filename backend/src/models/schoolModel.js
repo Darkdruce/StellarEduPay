@@ -2,6 +2,7 @@
 
 const mongoose = require('mongoose');
 const StellarSdk = require('@stellar/stellar-sdk');
+const { encryptWebhookSecret, decryptWebhookSecret } = require('../services/webhookSecretEncryption');
 
 /**
  * School model — each school is a fully independent tenant.
@@ -29,6 +30,15 @@ const schoolSchema = new mongoose.Schema(
     },
     network:        { type: String, enum: ['testnet', 'mainnet'], default: 'testnet' },
     isActive:       { type: Boolean, default: true, index: true },
+    /**
+     * Horizon paging cursor for the transaction poller (#839).
+     * Holds the `paging_token` of the most recently examined transaction for
+     * this school's wallet. The poller resumes ascending paging from this value
+     * each cycle, so it never re-scans history from genesis and never skips a
+     * transaction (gap-free, resumable). Null/unset = start from the oldest
+     * transaction on first run.
+     */
+    syncCursor:     { type: String, default: null },
     adminEmail:     { type: String, default: null },
     address:        { type: String, default: null },
     /**
@@ -57,7 +67,18 @@ const schoolSchema = new mongoose.Schema(
      * Used for date grouping in reports and dashboard metrics.
      * Defaults to UTC.
      */
-    timezone:       { type: String, default: 'UTC', trim: true },
+    timezone: {
+      type: String,
+      default: 'UTC',
+      trim: true,
+      validate: {
+        validator(tz) {
+          if (!tz) return true;
+          try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; } catch { return false; }
+        },
+        message: props => `'${props.value}' is not a valid IANA timezone identifier`,
+      },
+    },
     /**
      * Per-school webhook endpoint URL. Must be an https:// URL that resolves
      * to a public IP address (RFC 1918, loopback, and link-local are rejected).
@@ -72,6 +93,43 @@ const schoolSchema = new mongoose.Schema(
      */
     webhookSecret:  { type: String, default: null },
     /**
+     * Per-school webhook payload field controls.
+     * Determines which fields are included in outbound webhook payloads.
+     *
+     * allowedFields: whitelist of field names sent in every delivery.
+     *   Defaults to the safe minimal set (no PII: studentId and senderAddress
+     *   are excluded unless explicitly opted in).
+     *   See utils/buildWebhookPayload.js for the full field enum and defaults.
+     */
+    webhookPayloadConfig: {
+      allowedFields: {
+        type: [String],
+        default: () => [
+          'event',
+          'txHash',
+          'transactionHash',
+          'amount',
+          'asset',
+          'assetCode',
+          'status',
+          'schoolId',
+          'ts',
+          'timestamp',
+          'correlationId',
+          'referenceCode',
+          'finalFee',
+          'feeValidationStatus',
+          'confirmedAt',
+          'ledgerSequence',
+          'reason',
+          'isSuspicious',
+          'originalTxHash',
+          'refundTxHash',
+          'refundedAt',
+        ],
+      },
+    },
+    /**
      * Multiplier threshold for flagging suspicious payments.
      * Payments deviating from expected fee by more than this multiplier are flagged.
      * E.g., multiplier=3.0 flags payments >3× or <1/3 of expected fee.
@@ -83,6 +141,26 @@ const schoolSchema = new mongoose.Schema(
       default: 3.0,
       min: [1.1, 'suspiciousPaymentMultiplier must be at least 1.1'],
       max: [100, 'suspiciousPaymentMultiplier must not exceed 100'],
+    },
+    /**
+     * Per-tenant configuration for the suspicious-amount heuristic. A flat
+     * multiplier off the expected fee mis-fires for schools whose normal
+     * payments cluster differently; enabling the historical mode bases the
+     * threshold on the school's OWN confirmed-payment distribution instead.
+     *
+     *   mode               — 'fee_multiplier' (default; uses suspiciousPaymentMultiplier)
+     *                        or 'historical' (z-score against the school's history).
+     *   historicalWindowDays    — lookback window for building the distribution.
+     *   historicalStdDevMultiplier — flag amounts more than N std-devs from the mean.
+     *   historicalMinSamples    — minimum confirmed payments before the historical
+     *                             threshold engages (below this it falls back to
+     *                             the fee multiplier, avoiding cold-start noise).
+     */
+    suspiciousAmountConfig: {
+      mode: { type: String, enum: ['fee_multiplier', 'historical'], default: 'fee_multiplier' },
+      historicalWindowDays: { type: Number, default: 90, min: 1, max: 730 },
+      historicalStdDevMultiplier: { type: Number, default: 3.0, min: 1.0, max: 10 },
+      historicalMinSamples: { type: Number, default: 20, min: 1, max: 100000 },
     },
     /**
      * Maximum payment multiplier for this school.
@@ -109,6 +187,59 @@ const schoolSchema = new mongoose.Schema(
       default: 10000,
       min: [1, 'maxStudents must be at least 1'],
     },
+    /**
+     * Per-school email branding and localization fields.
+     *
+     * logoUrl        — URL to the school logo image, embedded in reminder emails.
+     * supportContact — Phone number or email for the school's support/admin contact.
+     * primaryColor   — Hex color for the email header background (e.g. '#1a56db').
+     * emailLocale    — BCP-47-style locale code for email template language.
+     *                  Supported: 'en', 'fr', 'es', 'pt', 'tpi' (Tok Pisin), 'ha' (Hausa).
+     */
+    logoUrl: { type: String, default: null },
+    supportContact: { type: String, default: null },
+    primaryColor: { type: String, default: '#1a56db' },
+    emailLocale: {
+      type: String,
+      default: 'en',
+      enum: ['en', 'fr', 'es', 'pt', 'tpi', 'ha'],
+    },
+    /**
+     * MFA (TOTP) protection for school admin operations.
+     * mfaSecret is AES-256-GCM encrypted; key is derived from JWT_SECRET.
+     * mfaBackupCodes holds SHA-256 hashes — each code is single-use.
+     */
+    mfaEnabled: { type: Boolean, default: false },
+    mfaSecret: { type: String, default: null },
+    /**
+     * Per-school maintenance mode. When true, the school's API endpoints
+     * return 503 Service Unavailable. Overrides the global maintenance mode
+     * in SystemConfig for this school only.
+     */
+    maintenanceMode: { type: Boolean, default: false },
+    /**
+     * Per-school settings overrides. Each key overrides the corresponding
+     * SystemConfig global default for this school only.
+     *
+     * Supported keys:
+     *   maxSyncBatchSize     — max transactions per polling cycle (number)
+     *   reminderEnabled      — enable/disable fee reminder emails (boolean)
+     *   reminderIntervalMs   — how often reminder scheduler runs (number, ms)
+     *   reminderTimeWindow   — { startHour, endHour } defining the local-time
+     *                          window during which reminders may be sent
+     *                          (default: { startHour: 8, endHour: 18 })
+     *   betaFeatures         — array of opted-in beta feature flags (string[])
+     */
+    settings: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
+    mfaBackupCodes: [
+      {
+        hash: { type: String, required: true },
+        used: { type: Boolean, default: false },
+      },
+    ],
   },
   { timestamps: true }
 );
@@ -122,8 +253,29 @@ schoolSchema.set('toJSON', {
     delete ret.jwtSecret;
     delete ret.webhookSecret;
     delete ret.internalNotes;
+    delete ret.mfaSecret;
+    delete ret.mfaBackupCodes;
     return ret;
   },
+});
+
+// ── Webhook secret encryption — Issue #75 ────────────────────────────────────
+// Encrypt webhookSecret at rest before persisting; decrypt transparently on load.
+// Both operations are no-ops when WEBHOOK_SECRET_ENCRYPTION_KEY is not set,
+// so local development without the key continues to work.
+
+schoolSchema.pre('save', function (next) {
+  if (this.isModified('webhookSecret') && this.webhookSecret != null) {
+    this.webhookSecret = encryptWebhookSecret(this.webhookSecret);
+  }
+  next();
+});
+
+// Decrypt after loading from DB so callers always receive plaintext.
+schoolSchema.post('init', function () {
+  if (this.webhookSecret != null) {
+    this.webhookSecret = decryptWebhookSecret(this.webhookSecret);
+  }
 });
 
 module.exports = mongoose.model('School', schoolSchema);

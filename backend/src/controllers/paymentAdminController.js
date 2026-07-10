@@ -6,11 +6,21 @@
 
 const Payment = require('../models/paymentModel');
 const Receipt = require('../models/receiptModel');
-const { createReceipt } = require('../services/receiptService');
+const Refund = require('../models/refundModel');
+const ReconciliationReport = require('../models/reconciliationReportModel');
+const { createReceipt, verifyReceiptSignature } = require('../services/receiptService');
 const { finalizeConfirmedPayments } = require('../services/stellarService');
 const { logAudit } = require('../services/auditService');
 const { syncDurationSeconds } = require('../metrics');
 const { syncPaymentsForSchool } = require('../services/stellarService');
+const { initiateRefund, getRefundsByPayment, getRefundsBySchool } = require('../services/refundService');
+const { generateReconciliationReport } = require('../services/reconciliationService');
+const lock = require('../services/distributedLock');
+const { ADMIN_PAYMENT_STATUS_TRANSITIONS } = require('../constants/paymentStatus');
+
+// TTL for the per-school distributed sync lock (60 s — long enough to complete
+// a full blockchain sync while short enough to auto-expire after a crash).
+const SYNC_LOCK_TTL_MS = parseInt(process.env.SYNC_LOCK_TTL_MS || '60000', 10);
 
 function wrapStellarError(err) {
   if (!err.code) {
@@ -20,18 +30,26 @@ function wrapStellarError(err) {
   return err;
 }
 
-const _syncLocks = new Set();
-
 async function syncAllPayments(req, res, next) {
   const { schoolId } = req;
-  if (_syncLocks.has(schoolId)) {
+
+  // Issue #69 — replace the in-process _syncLocks Set with a cross-replica
+  // distributed lock (Redis SET NX PX, in-process Map fallback when no Redis).
+  // Any replica that cannot acquire the lock immediately returns 409 so the
+  // caller knows a sync is already in flight somewhere in the cluster.
+  const lockKey = `sync:lock:${schoolId}`;
+  // acquire() returns { token, fencingToken } (or null). release() expects the
+  // raw token string, so destructure — passing the whole object never matches
+  // and the lock would never be released.
+  const acquired = await lock.acquire(lockKey, SYNC_LOCK_TTL_MS);
+  if (!acquired) {
     return res.status(409).json({ error: 'Sync already in progress', code: 'SYNC_IN_PROGRESS' });
   }
-  _syncLocks.add(schoolId);
+  const { token } = acquired;
+
   const stopSyncTimer = syncDurationSeconds.startTimer();
   try {
     const summary = await syncPaymentsForSchool(req.school);
-    stopSyncTimer();
 
     if (req.auditContext) {
       await logAudit({
@@ -74,10 +92,10 @@ async function syncAllPayments(req, res, next) {
         userAgent: req.auditContext.userAgent,
       });
     }
-    stopSyncTimer();
     next(wrapStellarError(err));
   } finally {
-    _syncLocks.delete(schoolId);
+    stopSyncTimer();
+    await lock.release(lockKey, token);
   }
 }
 
@@ -257,12 +275,11 @@ async function getStuckPayments(req, res, next) {
   }
 }
 
-// Allowed manual status transitions: from → [to, ...]
-const ALLOWED_TRANSITIONS = {
-  SUCCESS: ['DISPUTED'],
-  PENDING: ['FAILED'],
-  SUBMITTED: ['FAILED'],
-};
+// Admin-allowed manual status transitions: from → [to, ...]
+// Use the canonical transition table from constants/paymentStatus.js (Issue #72).
+// ADMIN_PAYMENT_STATUS_TRANSITIONS is the wider admin-path table that allows
+// transitions like DISPUTED → REFUNDED in addition to the normal set.
+const ALLOWED_TRANSITIONS = ADMIN_PAYMENT_STATUS_TRANSITIONS;
 
 async function updatePaymentStatus(req, res, next) {
   try {
@@ -272,19 +289,25 @@ async function updatePaymentStatus(req, res, next) {
     if (!newStatus || !reason) return res.status(400).json({ error: 'status and reason are required', code: 'VALIDATION_ERROR' });
     if (newStatus === 'PENDING') return res.status(400).json({ error: 'Cannot transition to PENDING', code: 'INVALID_TRANSITION' });
 
-    const payment = await Payment.findOne({ schoolId: req.schoolId, txHash }).lean();
+    const payment = await Payment.findOne({ schoolId: req.schoolId, txHash });
     if (!payment) {
       const err = new Error('Payment not found');
       err.code = 'NOT_FOUND';
       return next(err);
     }
 
-    const allowed = ALLOWED_TRANSITIONS[payment.status] || [];
+    const previousStatus = payment.status;
+    const allowed = ALLOWED_TRANSITIONS[previousStatus] || [];
     if (!allowed.includes(newStatus)) {
-      return res.status(400).json({ error: `Cannot transition from ${payment.status} to ${newStatus}`, code: 'INVALID_TRANSITION' });
+      return res.status(400).json({ error: `Cannot transition from ${previousStatus} to ${newStatus}`, code: 'INVALID_TRANSITION' });
     }
 
-    const updated = await Payment.findOneAndUpdate({ schoolId: req.schoolId, txHash }, { $set: { status: newStatus } }, { new: true });
+    // Set $locals.adminOverride so the pre-save hook uses ADMIN_PAYMENT_STATUS_TRANSITIONS
+    // instead of the narrower PAYMENT_STATUS_TRANSITIONS.  $locals is Mongoose's
+    // per-document transient store — it is never persisted and survives through save().
+    payment.$locals.adminOverride = true;
+    payment.status = newStatus;
+    const updated = await payment.save();
 
     await logAudit({
       schoolId: req.schoolId,
@@ -292,7 +315,79 @@ async function updatePaymentStatus(req, res, next) {
       performedBy: req.auditContext?.performedBy || 'unknown',
       targetId: txHash,
       targetType: 'payment',
-      details: { from: payment.status, to: newStatus, reason },
+      details: { from: previousStatus, to: newStatus, reason, adminOverride: true },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * PATCH /api/payments/:txHash/suspicion-review
+ *
+ * Review a flagged (suspicious) payment. Resolves the false-positive / fraud
+ * ambiguity an admin would otherwise have no way to act on:
+ *
+ *   action: 'clear'         — false positive. Removes the suspicious flag so the
+ *                             payment leaves the suspicious queue.
+ *   action: 'confirm_fraud' — confirmed fraudulent. Keeps it flagged/excluded
+ *                             and records the determination.
+ *
+ * The balance-affecting status (SUCCESS/FAILED/etc.) is intentionally left to
+ * the existing updatePaymentStatus flow so this endpoint never silently mutates
+ * student balances. Every review is written to the audit log.
+ */
+async function reviewSuspiciousPayment(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { txHash } = req.params;
+    const { action, note } = req.body;
+
+    if (!['clear', 'confirm_fraud'].includes(action)) {
+      return res.status(400).json({
+        error: "action must be 'clear' or 'confirm_fraud'",
+        code: 'VALIDATION_ERROR',
+      });
+    }
+
+    const payment = await Payment.findOne({ schoolId, txHash });
+    if (!payment) {
+      return res.status(404).json({ error: 'Payment not found', code: 'NOT_FOUND' });
+    }
+    if (!payment.isSuspicious && payment.suspicionReviewStatus === 'flagged') {
+      return res.status(400).json({ error: 'Payment is not flagged as suspicious', code: 'NOT_FLAGGED' });
+    }
+
+    const previousStatus = payment.suspicionReviewStatus;
+    const reviewer = req.auditContext?.performedBy || 'unknown';
+
+    payment.suspicionReviewStatus = action === 'clear' ? 'cleared' : 'confirmed_fraud';
+    payment.suspicionReviewedBy = reviewer;
+    payment.suspicionReviewedAt = new Date();
+    payment.suspicionReviewNote = note || null;
+    // Clearing a false positive removes it from the suspicious queue; confirming
+    // fraud keeps the flag.
+    if (action === 'clear') payment.isSuspicious = false;
+
+    const updated = await payment.save();
+
+    await logAudit({
+      schoolId,
+      action: 'payment_suspicion_review',
+      performedBy: reviewer,
+      targetId: txHash,
+      targetType: 'payment',
+      details: {
+        from: previousStatus,
+        to: payment.suspicionReviewStatus,
+        suspicionReason: payment.suspicionReason,
+        note: note || null,
+      },
       result: 'success',
       ipAddress: req.auditContext?.ipAddress,
       userAgent: req.auditContext?.userAgent,
@@ -326,6 +421,134 @@ function streamPaymentEvents(req, res) {
   });
 }
 
+async function initiatePaymentRefund(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { txHash } = req.params;
+    const { reason } = req.body;
+
+    if (!reason) return res.status(400).json({ error: 'reason is required', code: 'VALIDATION_ERROR' });
+
+    const payment = await Payment.findOne({ schoolId, txHash, status: 'SUCCESS' });
+    if (!payment) {
+      return res.status(404).json({ error: 'Confirmed payment not found', code: 'NOT_FOUND' });
+    }
+
+    const refund = await initiateRefund(
+      schoolId,
+      txHash,
+      payment.studentId,
+      payment.amount,
+      reason,
+      req.auditContext?.performedBy || 'unknown'
+    );
+
+    await logAudit({
+      schoolId,
+      action: 'refund_initiated',
+      performedBy: req.auditContext?.performedBy || 'unknown',
+      targetId: txHash,
+      targetType: 'refund',
+      details: { refundId: refund._id.toString(), amount: payment.amount },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.status(201).json(refund);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getPaymentRefunds(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { txHash } = req.params;
+
+    const refunds = await getRefundsByPayment(schoolId, txHash);
+    res.json({ refunds });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getSchoolRefunds(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { status } = req.query;
+
+    const refunds = await getRefundsBySchool(schoolId, status);
+    res.json({ refunds, count: refunds.length });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function verifyReceipt(req, res, next) {
+  try {
+    const { receiptId } = req.params;
+
+    const receipt = await Receipt.findById(receiptId).lean();
+    if (!receipt) return res.status(404).json({ error: 'Receipt not found', code: 'NOT_FOUND' });
+
+    try {
+      const isValid = verifyReceiptSignature(receipt);
+      res.json({
+        receiptId,
+        valid: isValid,
+        txHash: receipt.txHash,
+        amount: receipt.amount,
+        confirmedAt: receipt.confirmedAt,
+      });
+    } catch (err) {
+      res.json({ receiptId, valid: false, error: 'Signature verification failed' });
+    }
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getReconciliationReports(req, res, next) {
+  try {
+    const { schoolId } = req;
+    const { limit = 30 } = req.query;
+
+    const reports = await ReconciliationReport.find({ schoolId })
+      .sort({ reportedAt: -1 })
+      .limit(Math.min(parseInt(limit), 100))
+      .lean();
+
+    res.json({ reports, count: reports.length });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function generateSchoolReconciliationReport(req, res, next) {
+  try {
+    const { schoolId } = req;
+
+    const report = await generateReconciliationReport(schoolId);
+
+    await logAudit({
+      schoolId,
+      action: 'reconciliation_report_generated',
+      performedBy: req.auditContext?.performedBy || 'unknown',
+      targetId: schoolId,
+      targetType: 'reconciliation',
+      details: { reportId: report._id.toString(), drift: report.drift },
+      result: 'success',
+      ipAddress: req.auditContext?.ipAddress,
+      userAgent: req.auditContext?.userAgent,
+    });
+
+    res.status(201).json(report);
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   syncAllPayments,
   getSyncStatus,
@@ -338,6 +561,14 @@ module.exports = {
   getQueueJobStatus,
   getStuckPayments,
   updatePaymentStatus,
+  reviewSuspiciousPayment,
   streamPaymentEvents,
-  _syncLocks,
+  initiatePaymentRefund,
+  getPaymentRefunds,
+  getSchoolRefunds,
+  verifyReceipt,
+  getReconciliationReports,
+  generateSchoolReconciliationReport,
+  // Exposed for testing — callers can introspect the lock state
+  _lock: lock,
 };

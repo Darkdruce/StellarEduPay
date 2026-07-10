@@ -43,7 +43,29 @@ jest.mock('ioredis', () => {
       mockRedisStore.set(key, { value, expiresAt: ttl != null ? Date.now() + ttl : null });
       return 'OK';
     }
-    async eval(_s, _n, key, token) {
+    async eval(script, numKeys, ...args) {
+      const key = args[0];
+
+      // Fence acquisition script
+      if (script && script.includes('incr') && numKeys === 2 && args.length >= 4) {
+        const fenceKey = args[1];
+        const token = args[2];
+        const ttl = args[3];
+
+        const existing = mockRedisStore.get(key);
+        const alive = existing && (existing.expiresAt == null || existing.expiresAt > Date.now());
+        if (alive && existing.value) return null;
+
+        const existingFence = mockRedisStore.get(fenceKey);
+        const newFence = existingFence ? existingFence.fencingToken + 1 : 1;
+        mockRedisStore.set(fenceKey, { fencingToken: newFence });
+        mockRedisStore.set(key, { value: token, expiresAt: ttl != null ? Date.now() + ttl : null });
+
+        return newFence;
+      }
+
+      // Release script
+      const token = args[1];
       const existing = mockRedisStore.get(key);
       if (existing && existing.value === token) { mockRedisStore.delete(key); return 1; }
       return 0;
@@ -94,8 +116,21 @@ jest.mock('../src/services/stellarService', () => ({
   extractValidPayment: async () => ({ payOp: { amount: '50', from: 'GSENDER' }, memo: 's1', asset: 'XLM' }),
   validatePaymentAgainstFee: () => ({ valid: true }),
   detectMemoCollision: async () => ({ suspicious: false, reason: null }),
+  detectCrossSchoolMemoCollision: async () => ({ suspicious: false, reason: null }),
   detectAbnormalPatterns: async () => ({ suspicious: false, reason: null }),
   checkConfirmationStatus: async () => true,
+  determineConfirmationState: async () => ({
+    state: 'confirmed',
+    changed: true,
+    confirmationStatus: 'confirmed',
+    latestLedgerSequence: 102,
+  }),
+}));
+
+jest.mock('../src/services/concurrentPaymentProcessor', () => ({
+  concurrentPaymentProcessor: {
+    getStats: () => ({ queueDepth: 0, maxQueueDepth: 100 }),
+  },
 }));
 
 jest.mock('../src/utils/paymentLimits', () => ({

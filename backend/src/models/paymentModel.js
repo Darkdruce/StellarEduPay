@@ -3,6 +3,17 @@
 const mongoose = require('mongoose');
 const softDelete = require('../utils/softDelete');
 const memoEncryption = require('../utils/memoEncryption');
+const tenantScope = require('../plugins/tenantScope');
+const {
+  CONFIRMATION_STATES,
+  CONFIRMATION_STATE_TRANSITIONS,
+} = require('../services/paymentConfirmationStateMachine');
+const {
+  PAYMENT_STATUS_VALUES,
+  PAYMENT_STATUS_TRANSITIONS,
+  ADMIN_PAYMENT_STATUS_TRANSITIONS,
+  isTransitionAllowed,
+} = require('../constants/paymentStatus');
 
 const paymentSchema = new mongoose.Schema(
   {
@@ -11,24 +22,91 @@ const paymentSchema = new mongoose.Schema(
 
     // unique: false here — uniqueness is enforced by the compound index { schoolId, txHash } below
     txHash: { type: String, required: true, index: true },
-    amount: { type: Number, required: true },
-    feeAmount: { type: Number, default: null },
+    amount: {
+      type: Number,
+      required: true,
+      min: [0, 'amount must be non-negative'],
+      validate: [
+        {
+          validator: (v) => Number.isFinite(v),
+          message: 'amount must be a finite number',
+        },
+      ],
+    },
+
+    // Correlation ID tying this payment to its full async lifecycle (polling
+    // -> queue -> processor -> webhook -> SSE). Deterministically derived
+    // from txHash — see utils/correlationId.js.
+    correlationId: { type: String, default: null, index: true },
+    feeAmount: {
+      type: Number,
+      default: null,
+      min: [0, 'feeAmount must be non-negative'],
+      validate: [
+        {
+          validator: (v) => v === null || v === undefined || Number.isFinite(v),
+          message: 'feeAmount must be a finite number or null',
+        },
+      ],
+    },
     feeCategory: { type: String, default: null, index: true },
     feeValidationStatus: { type: String, enum: ['valid', 'underpaid', 'overpaid', 'partial', 'unknown'], default: 'unknown' },
-    excessAmount: { type: Number, default: 0 },
+    excessAmount: {
+      type: Number,
+      default: 0,
+      min: [0, 'excessAmount must be non-negative'],
+      validate: [
+        {
+          validator: (v) => Number.isFinite(v),
+          message: 'excessAmount must be a finite number',
+        },
+      ],
+    },
 
-    assetCode: { type: String, default: null },
+    assetCode: {
+      type: String,
+      default: null,
+      enum: {
+        values: ['XLM', 'USDC', null],
+        message: "assetCode must be 'XLM', 'USDC', or null",
+      },
+    },
     assetType: { type: String, default: null },
 
-    status: { type: String, enum: ['PENDING', 'SUBMITTED', 'SUCCESS', 'FAILED', 'DISPUTED', 'INVALID'], default: 'PENDING' },
+    // Canonical status values are imported from constants/paymentStatus.js (Issue #72).
+    status: { type: String, enum: PAYMENT_STATUS_VALUES, default: 'PENDING' },
     memo: { type: String },
     senderAddress: { type: String, default: null },
     isSuspicious: { type: Boolean, default: false },
     suspicionReason: { type: String, default: null },
+    // Review workflow for flagged payments (issue #852). A flag starts as
+    // 'flagged'; an admin clears it (false positive → 'cleared', restoring the
+    // payment) or confirms it as fraud ('confirmed_fraud'). All transitions are
+    // captured in the audit log.
+    suspicionReviewStatus: {
+      type: String,
+      enum: ['flagged', 'cleared', 'confirmed_fraud'],
+      default: 'flagged',
+    },
+    suspicionReviewedBy: { type: String, default: null },
+    suspicionReviewedAt: { type: Date, default: null },
+    suspicionReviewNote: { type: String, default: null },
 
     ledger: { type: Number, default: null },
     ledgerSequence: { type: Number, default: null },
+    // Legacy 3-value status, kept for backward compatibility with existing
+    // queries/UI. Always derived from confirmationState (see
+    // paymentConfirmationStateMachine.deriveLegacyConfirmationStatus).
     confirmationStatus: { type: String, enum: ['pending_confirmation', 'confirmed', 'failed'], default: 'pending_confirmation' },
+    // Fine-grained finality state machine (issue #747):
+    // detected -> pending -> confirmed -> finalized, with failed as a
+    // terminal escape from any non-terminal state. See
+    // backend/src/services/paymentConfirmationStateMachine.js for the policy.
+    confirmationState: {
+      type: String,
+      enum: Object.values(CONFIRMATION_STATES),
+      default: CONFIRMATION_STATES.DETECTED,
+    },
 
     // Audit trail
     transactionHash: { type: String, default: null, index: true },
@@ -49,6 +127,18 @@ const paymentSchema = new mongoose.Schema(
 
     // Soft Delete
     deletedAt: { type: Date, default: null, index: true },
+
+    // #883 — Fiat snapshot: rate locked at confirmation time.
+    // Storing this prevents historical report totals from drifting as exchange
+    // rates move. Reports use this field; a separate "current-rate" mode can
+    // convert on-the-fly by ignoring fiatSnapshot.
+    fiatSnapshot: {
+      fiatAmount:   { type: Number, default: null },  // crypto_amount × fiatRate
+      fiatCurrency: { type: String, default: null },  // e.g. 'USD'
+      fiatRate:     { type: Number, default: null },  // rate at confirmation
+      rateSource:   { type: String, default: null },  // 'coingecko' | 'coinbase' | etc.
+      rateTimestamp:{ type: Date,   default: null },  // when the rate was fetched
+    },
   },
   {
     timestamps: true,
@@ -58,6 +148,7 @@ const paymentSchema = new mongoose.Schema(
 );
 
 softDelete(paymentSchema);
+paymentSchema.plugin(tenantScope, { modelName: 'Payment' });
 
 // Indexes
 // Compound unique index enforces per-school txHash uniqueness (same tx can exist in two schools).
@@ -72,6 +163,7 @@ paymentSchema.index({ schoolId: 1, studentId: 1, confirmedAt: -1 });
 paymentSchema.index({ schoolId: 1, feeValidationStatus: 1 });
 paymentSchema.index({ schoolId: 1, isSuspicious: 1 });
 paymentSchema.index({ schoolId: 1, confirmationStatus: 1 });
+paymentSchema.index({ confirmationState: 1 });
 // Partial compound index for report queries: filters out orphaned/deleted
 // payments so MongoDB only indexes documents that appear in aggregation
 // results, keeping the index lean and report queries fast.
@@ -93,22 +185,16 @@ paymentSchema.virtual('stellarExplorerUrl').get(function () {
 });
 
 /**
- * Allowed manual status transitions, mirroring the controller's ALLOWED_TRANSITIONS.
- * This table is the single source of truth for model-level transition validation.
+ * Status transition guard (pre-save hook).
  *
- * SUCCESS   → DISPUTED  : admin marks a confirmed payment as disputed
- * PENDING   → FAILED    : admin manually fails a stuck pending payment
- * SUBMITTED → FAILED    : admin manually fails a stuck submitted payment
+ * Uses the canonical transition tables imported from constants/paymentStatus.js
+ * (Issue #72). See that module for the full allowed-transitions specification.
  *
- * All other transitions (e.g. FAILED → SUCCESS) are explicitly disallowed.
+ * Callers with admin authority may set `payment.$locals.adminOverride = true`
+ * before calling .save() to use the wider admin transition table; the override
+ * must be audited explicitly by the caller.
  */
-const PAYMENT_STATUS_TRANSITIONS = {
-  SUCCESS:   ['DISPUTED'],
-  PENDING:   ['FAILED'],
-  SUBMITTED: ['FAILED'],
-};
-
-paymentSchema.pre('save', function (next) {
+paymentSchema.pre('save', async function () {
   // Use in-memory Mongoose helpers instead of a DB query to avoid an N+1
   // round-trip on every save. this.isNew is true for inserts; for existing
   // documents Mongoose tracks the original field values so we can check the
@@ -121,16 +207,57 @@ paymentSchema.pre('save', function (next) {
     const newStatus = this.status;
 
     if (originalStatus !== null && originalStatus !== newStatus) {
-      // Status is being changed — validate against the allowed transition table.
-      const allowed = PAYMENT_STATUS_TRANSITIONS[originalStatus] || [];
-      if (!allowed.includes(newStatus)) {
+      // Callers with admin authority may set $locals.adminOverride = true to
+      // use the wider admin transition table (e.g. DISPUTED → REFUNDED).
+      // The override must be audited explicitly by the caller.
+      const adminOverride = !!(this.$locals && this.$locals.adminOverride);
+      if (!isTransitionAllowed(originalStatus, newStatus, adminOverride)) {
         const err = new Error(
           `Payment status transition from ${originalStatus} to ${newStatus} is not allowed`,
         );
         err.code = 'INVALID_TRANSITION';
-        return next(err);
+        throw err;
       }
     }
+
+    // Same backstop for the finality state machine (issue #747). Callers are
+    // expected to compute the next value via
+    // paymentConfirmationStateMachine.resolveNextState() before assigning it
+    // here; this guard catches any caller that bypasses that and tries to
+    // persist an illegal jump (e.g. finalized -> pending).
+    const originalConfirmationState = savedState ? savedState.confirmationState : null;
+    const newConfirmationState = this.confirmationState;
+
+    if (
+      originalConfirmationState != null &&
+      originalConfirmationState !== newConfirmationState
+    ) {
+      const allowedStates = CONFIRMATION_STATE_TRANSITIONS[originalConfirmationState] || [];
+      if (!allowedStates.includes(newConfirmationState)) {
+        const err = new Error(
+          `Payment confirmationState transition from ${originalConfirmationState} to ${newConfirmationState} is not allowed`,
+        );
+        err.code = 'INVALID_CONFIRMATION_TRANSITION';
+        throw err;
+      }
+    }
+  }
+
+  // Issue #68 — Normalize numeric precision to 7 decimal places (Stellar's
+  // canonical precision) so aggregates never accumulate floating-point drift.
+  // Also rejects any non-finite value that somehow slipped past the validator
+  // (e.g. values written directly via update operators bypass Mongoose validators).
+  const STELLAR_DECIMALS = 7;
+  const normalize = (v) => (v != null && Number.isFinite(v) ? parseFloat(v.toFixed(STELLAR_DECIMALS)) : v);
+
+  if (this.isModified('amount') && this.amount != null) {
+    this.amount = normalize(this.amount);
+  }
+  if (this.isModified('feeAmount') && this.feeAmount != null) {
+    this.feeAmount = normalize(this.feeAmount);
+  }
+  if (this.isModified('excessAmount') && this.excessAmount != null) {
+    this.excessAmount = normalize(this.excessAmount);
   }
 
   // Encrypt memo field at rest using application-level AES-256-GCM encryption.
@@ -138,8 +265,6 @@ paymentSchema.pre('save', function (next) {
   if (this.isModified('memo') && this.memo != null) {
     this.memo = memoEncryption.encryptMemo(this.memo);
   }
-
-  next();
 });
 
 // Decrypt memo transparently after loading from the database.
@@ -166,11 +291,13 @@ paymentSchema.post('save', async function () {
         studentId: this.studentId,
       });
 
-      if (student && student.contactEmail) {
+      if (student && student.parentEmail) {
         // Queue email via BullMQ (non-blocking)
         const emailService = require('./emailService');
         await emailService.sendPaymentReceipt({
-          to: student.contactEmail,
+          schoolId: this.schoolId,
+          studentId: this.studentId,
+          to: student.parentEmail,
           studentName: student.name,
           amount: this.amount,
           txHash: this.txHash,
@@ -178,6 +305,10 @@ paymentSchema.post('save', async function () {
           remainingBalance: student.feeAmount - this.amount,
         });
       }
+
+      // Invalidate report cache on new successful payments
+      const reportCacheInvalidator = require('../services/reportCacheInvalidator');
+      reportCacheInvalidator.invalidate(this.schoolId);
     }
   } catch (err) {
     // Log error but don't fail the save

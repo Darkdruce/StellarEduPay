@@ -20,8 +20,18 @@
 
 const { logger } = require('../utils/logger');
 const { httpRequestDurationSeconds } = require('../metrics');
+const { generateCorrelationId } = require('../utils/correlationId');
 
 const DEFAULT_REDACT_FIELDS = ['txHash', 'studentId', 'memo', 'senderAddress'];
+
+// Headers that must never appear in logs (auth/session/PII)
+const SENSITIVE_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'idempotency-key',
+]);
 
 function getRedactFields() {
   if (process.env.LOG_REDACT_FIELDS) {
@@ -42,6 +52,15 @@ function redact(obj) {
   return result;
 }
 
+function redactHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k] = SENSITIVE_HEADERS.has(k.toLowerCase()) ? '[REDACTED]' : v;
+  }
+  return out;
+}
+
 let _counter = 0;
 
 function generateRequestId() {
@@ -52,10 +71,15 @@ function generateRequestId() {
 function requestLogger() {
   return (req, res, next) => {
     const requestId = generateRequestId();
+    const correlationId = generateCorrelationId();
     const startedAt = Date.now();
 
     // Attach to req so downstream handlers can reference it (e.g. error logs)
     req.requestId = requestId;
+    req.correlationId = correlationId;
+
+    // Propagate correlation ID to the response so callers can trace end-to-end
+    res.setHeader('X-Correlation-ID', correlationId);
 
     const ip =
       (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
@@ -64,6 +88,7 @@ function requestLogger() {
 
     const logData = {
       requestId,
+      correlationId,
       method: req.method,
       url: req.originalUrl,
       ip,
@@ -76,6 +101,9 @@ function requestLogger() {
     if (req.query && Object.keys(req.query).length > 0) {
       logData.query = redact(req.query);
     }
+    if (process.env.LOG_REQUEST_HEADERS === 'true') {
+      logData.headers = redactHeaders(req.headers);
+    }
 
     logger.info('[Request] incoming', logData);
 
@@ -85,6 +113,7 @@ function requestLogger() {
 
       logger[level]('[Request] completed', {
         requestId,
+        correlationId,
         method: req.method,
         url: req.originalUrl,
         statusCode: res.statusCode,
@@ -105,4 +134,4 @@ function requestLogger() {
   };
 }
 
-module.exports = { requestLogger, redact };
+module.exports = { requestLogger, redact, redactHeaders };

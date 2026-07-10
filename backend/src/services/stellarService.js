@@ -5,20 +5,34 @@ const {
   server,
   isAcceptedAsset,
   CONFIRMATION_THRESHOLD,
+  FINALIZATION_THRESHOLD,
 } = require("../config/stellarConfig");
+const mongoose = require("mongoose");
 const Payment = require("../models/paymentModel");
 const Student = require("../models/studentModel");
 const PaymentIntent = require("../models/paymentIntentModel");
 const { validatePaymentAmount } = require("../utils/paymentLimits");
+const { toStroops, stroopsToNumber, compareAmounts } = require("../utils/stellarAmount");
 const { withStellarRetry } = require("../utils/withStellarRetry");
 const { savePayment } = require("./transactionService");
+const { deriveCorrelationId } = require("../utils/correlationId");
+const {
+  CONFIRMATION_STATES,
+  computeTargetState,
+  resolveNextState,
+  deriveLegacyConfirmationStatus,
+  isConfirmedOrAbove,
+} = require("./paymentConfirmationStateMachine");
 const logger = require("../utils/logger").child("StellarService");
 
 function detectAsset(payOp) {
   const assetType = payOp.asset_type;
   const assetCode = assetType === "native" ? "XLM" : payOp.asset_code;
   const assetIssuer = assetType === "native" ? null : payOp.asset_issuer;
-  const { accepted } = isAcceptedAsset(assetCode, assetType);
+  // Pass the issuer so credit assets (USDC) are validated against the pinned
+  // canonical issuer for the active network (#841). A fake "USDC" from any
+  // other issuer is rejected here.
+  const { accepted } = isAcceptedAsset(assetCode, assetType, assetIssuer);
   if (!accepted) return null;
   return { assetCode, assetType, assetIssuer };
 }
@@ -53,7 +67,11 @@ function normalizeAmount(rawAmount) {
  *   - MEMO_ID, MEMO_HASH, MEMO_RETURN: Unsupported types (UNSUPPORTED_MEMO_TYPE)
  */
 async function extractValidPayment(tx, walletAddress) {
-  if (!tx.successful) return null;
+  // #840 — A transaction can be included in a ledger yet have
+  // `successful === false` (e.g. a failed operation). Such transactions must
+  // NEVER be credited. Require an explicit success flag rather than merely
+  // truthy, so a failed-but-included tx (or one missing the flag) is rejected.
+  if (tx.successful !== true) return null;
 
   // Unwrap fee-bump transaction to get the inner transaction
   const innerTx = tx.inner_transaction || tx;
@@ -82,6 +100,9 @@ async function extractValidPayment(tx, walletAddress) {
   const ops = await withStellarRetry(() => innerTx.operations(), {
     label: "extractValidPayment.operations",
   });
+  // #840 — only a successful `payment` operation landing on the school wallet
+  // is creditable. detectAsset then enforces the asset/issuer (#841): a
+  // wrong-asset or fake-issuer operation yields null and is rejected here.
   const payOp = ops.records.find(
     (op) => op.type === "payment" && op.to === walletAddress,
   );
@@ -94,15 +115,21 @@ async function extractValidPayment(tx, walletAddress) {
 }
 
 function validatePaymentAgainstFee(paymentAmount, expectedFee) {
-  if (paymentAmount < expectedFee) {
+  // Compare in exact integer stroop space (#842). Float comparison of the paid
+  // amount vs the fee can mis-judge an exact-match payment as short/over by a
+  // rounding epsilon; stroop comparison is exact.
+  const paidStroops = toStroops(paymentAmount);
+  const feeStroops = toStroops(expectedFee);
+
+  if (paidStroops < feeStroops) {
     return {
       status: "underpaid",
       excessAmount: 0,
       message: `Payment of ${paymentAmount} is less than the required fee of ${expectedFee}`,
     };
   }
-  if (paymentAmount > expectedFee) {
-    const excess = parseFloat((paymentAmount - expectedFee).toFixed(7));
+  if (paidStroops > feeStroops) {
+    const excess = stroopsToNumber(paidStroops - feeStroops);
     return {
       status: "overpaid",
       excessAmount: excess,
@@ -116,13 +143,57 @@ function validatePaymentAgainstFee(paymentAmount, expectedFee) {
   };
 }
 
-async function checkConfirmationStatus(txLedger) {
+async function getLatestLedgerSequence(label) {
   const latestLedger = await withStellarRetry(
     () => server.ledgers().order("desc").limit(1).call(),
-    { label: "checkConfirmationStatus" },
+    { label },
   );
-  const latestSequence = latestLedger.records[0].sequence;
+  return latestLedger.records[0].sequence;
+}
+
+async function checkConfirmationStatus(txLedger) {
+  const latestSequence = await getLatestLedgerSequence(
+    "checkConfirmationStatus",
+  );
   return latestSequence - txLedger >= CONFIRMATION_THRESHOLD;
+}
+
+/**
+ * Determine the next confirmation state for a payment per the finality
+ * policy (issue #747). Fetches the latest Horizon ledger sequence, computes
+ * the state the ledger depth + suspicion flag implies, then resolves it
+ * against the payment's current state via the idempotent/monotonic state
+ * machine — re-running this with the same inputs (e.g. a re-poll of the same
+ * ledger range) always yields the same result and never regresses a payment.
+ *
+ * @param {number|null} txLedger - ledger sequence the tx was included in
+ * @param {string} [currentState] - payment's current confirmationState (defaults to 'detected')
+ * @param {boolean} [isSuspicious] - fraud/anomaly signal
+ * @returns {Promise<{ state: string, changed: boolean, confirmationStatus: string, latestLedgerSequence: number }>}
+ */
+async function determineConfirmationState(
+  txLedger,
+  currentState = CONFIRMATION_STATES.DETECTED,
+  isSuspicious = false,
+) {
+  const latestLedgerSequence = await getLatestLedgerSequence(
+    "determineConfirmationState",
+  );
+  const targetState = computeTargetState({
+    txLedger,
+    latestLedgerSequence,
+    isSuspicious,
+    confirmationThreshold: CONFIRMATION_THRESHOLD,
+    finalizationThreshold: FINALIZATION_THRESHOLD,
+  });
+  const { state, changed } = resolveNextState(currentState, targetState);
+
+  return {
+    state,
+    changed,
+    confirmationStatus: deriveLegacyConfirmationStatus(state),
+    latestLedgerSequence,
+  };
 }
 
 /**
@@ -143,7 +214,7 @@ async function detectMemoCollision(
 
   const recentFromOtherSender = await Payment.findOne({
     schoolId,
-    studentId: memo,
+    memo,
     senderAddress: { $ne: senderAddress, $exists: true, $ne: null },
     confirmedAt: { $gte: windowStart },
     deletedAt: null,
@@ -165,13 +236,97 @@ async function detectMemoCollision(
 }
 
 /**
+ * Detect memo collision across schools: the same memo (student ID) was
+ * recorded as a confirmed payment for a *different* school within the last
+ * 24 hours. Memos are only unique within a school's own student roster
+ * (`Student.studentId` is school-scoped), so two unrelated schools can
+ * legitimately assign the same ID to different students — but a payment
+ * landing under that ID at two schools in a short window is worth flagging
+ * for manual review rather than silently trusting both.
+ *
+ * Deliberately independent of `detectMemoCollision` (which is single-school,
+ * sender-based) — this is the cross-school signal the original function
+ * explicitly does not cover.
+ */
+async function detectCrossSchoolMemoCollision(memo, schoolId, txDate) {
+  const COLLISION_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const windowStart = new Date(txDate.getTime() - COLLISION_WINDOW_MS);
+
+  const recentFromOtherSchool = await Payment.findOne({
+    schoolId: { $ne: schoolId },
+    studentId: memo,
+    confirmedAt: { $gte: windowStart },
+    deletedAt: null,
+  });
+
+  if (recentFromOtherSchool) {
+    return {
+      suspicious: true,
+      reason:
+        'Memo "' +
+        memo +
+        '" was also used for a payment to a different school (' +
+        recentFromOtherSchool.schoolId +
+        ") within the last 24 hours",
+    };
+  }
+
+  return { suspicious: false, reason: null };
+}
+
+/**
+ * Compute the mean and (population) standard deviation of a school's confirmed,
+ * non-suspicious payment amounts within a lookback window. Used to base the
+ * suspicious-amount threshold on each tenant's OWN distribution rather than a
+ * flat multiplier off the expected fee.
+ *
+ * @param {string} schoolId
+ * @param {number} windowDays lookback window
+ * @returns {Promise<{count:number, mean:number, std:number}>}
+ */
+async function computeHistoricalAmountStats(schoolId, windowDays) {
+  const windowStart = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+  const rows = await Payment.aggregate([
+    {
+      $match: {
+        schoolId,
+        isSuspicious: false,
+        deletedAt: null,
+        confirmedAt: { $gte: windowStart },
+        amount: { $gt: 0 },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        count: { $sum: 1 },
+        mean: { $avg: "$amount" },
+        std: { $stdDevPop: "$amount" },
+      },
+    },
+  ]);
+
+  if (!rows.length) return { count: 0, mean: 0, std: 0 };
+  return {
+    count: rows[0].count || 0,
+    mean: rows[0].mean || 0,
+    std: rows[0].std || 0,
+  };
+}
+
+/**
  * Detect abnormal payment patterns:
  *  1. Rapid repeated transactions — same sender sends more than RAPID_TX_LIMIT
  *     payments within RAPID_TX_WINDOW_MS.
- *  2. Unusual amount — payment deviates from the expected fee by more than
- *     the school's configured multiplier (default 3×).
+ *  2. Unusual amount — by default the payment deviates from the expected fee by
+ *     more than the school's configured multiplier (default 3×). When the
+ *     school opts into historical mode (`amountConfig.mode === 'historical'`)
+ *     and enough history exists, the threshold is a z-score against the
+ *     school's own confirmed-payment distribution instead.
  *
  * Returns { suspicious: boolean, reason: string|null }
+ *
+ * @param {object|null} amountConfig per-tenant suspiciousAmountConfig (optional)
  */
 async function detectAbnormalPatterns(
   senderAddress,
@@ -180,6 +335,7 @@ async function detectAbnormalPatterns(
   txDate,
   schoolId,
   suspiciousPaymentMultiplier = 3.0,
+  amountConfig = null,
 ) {
   const RAPID_TX_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
   const RAPID_TX_LIMIT = 3; // more than this many = suspicious
@@ -202,13 +358,41 @@ async function detectAbnormalPatterns(
     }
   }
 
-  // 2. Unusual amount check — uses school's configured multiplier
-  if (expectedFee && expectedFee > 0) {
+  // 2. Unusual amount check.
+  // 2a. Historical mode — flag amounts far from the school's own mean. Falls
+  //     back to the fee-multiplier check below if there isn't enough history.
+  let historicalApplied = false;
+  if (amountConfig && amountConfig.mode === "historical" && schoolId) {
+    const windowDays = amountConfig.historicalWindowDays || 90;
+    const stdMultiplier = amountConfig.historicalStdDevMultiplier || 3.0;
+    const minSamples = amountConfig.historicalMinSamples || 20;
+
+    try {
+      const stats = await computeHistoricalAmountStats(schoolId, windowDays);
+      if (stats.count >= minSamples && stats.std > 0) {
+        historicalApplied = true;
+        const zScore = Math.abs(paymentAmount - stats.mean) / stats.std;
+        if (zScore >= stdMultiplier) {
+          reasons.push(
+            `Unusual payment amount (z-score ${zScore.toFixed(2)} vs school mean ${stats.mean.toFixed(2)}, threshold ${stdMultiplier.toFixed(1)}σ over ${stats.count} payments)`,
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn("Historical suspicious-amount check failed; falling back to fee multiplier", {
+        schoolId,
+        error: err.message,
+      });
+    }
+  }
+
+  // 2b. Fee-multiplier mode (default, and the historical fallback).
+  if (!historicalApplied && expectedFee && expectedFee > 0) {
     const ratio = paymentAmount / expectedFee;
     const lowerThreshold = 1 / suspiciousPaymentMultiplier;
     // For multiplier 5.0, use exclusive boundary; for others, use inclusive
     const lowerBoundExclusive = Math.abs(suspiciousPaymentMultiplier - 5.0) < 0.01;
-    
+
     if (
       ratio >= suspiciousPaymentMultiplier ||
       (lowerBoundExclusive ? ratio < lowerThreshold : ratio <= lowerThreshold)
@@ -240,7 +424,7 @@ async function detectAbnormalPatterns(
  *   UNSUPPORTED_ASSET (400)   — asset not accepted
  *   AMOUNT_TOO_LOW/HIGH (400) — outside configured limits
  */
-async function verifyTransaction(txHash, walletAddress) {
+async function verifyTransaction(txHash, walletAddress, schoolId = null) {
   const tx = await withStellarRetry(
     () => server.transactions().transaction(txHash).call(),
     { label: "verifyTransaction" },
@@ -324,9 +508,10 @@ async function verifyTransaction(txHash, walletAddress) {
     throw err;
   }
 
-  // 6. Look up student to validate fee (student lookup is not school-scoped here
-  //    since memo = studentId; recordPayment caller passes schoolId explicitly)
-  const student = await Student.findOne({ studentId: memo });
+  // 6. Look up student to validate fee. School-scope when schoolId is provided so
+  //    the same studentId string used across two schools resolves to the correct one.
+  const studentQuery = schoolId ? { schoolId, studentId: memo } : { studentId: memo };
+  const student = await Student.findOne(studentQuery);
   const feeAmount = student ? student.feeAmount : null;
 
   const feeValidation =
@@ -404,10 +589,6 @@ async function syncPaymentsForSchool(school) {
       if (existing) { summary.alreadyProcessed++; done = true; break; }
 
       summary.new++;
-      if (existing) {
-        done = true;
-        break;
-      }
 
       const valid = await extractValidPayment(tx, stellarAddress);
       if (!valid) {
@@ -447,10 +628,17 @@ async function syncPaymentsForSchool(school) {
         continue;
       }
 
+      // Decouple crediting from intent existence (#848): a pending intent is the
+      // preferred path, but if none exists (expired or never created) we fall back
+      // to matching by memo (= studentId) directly. This ensures a late-but-valid
+      // on-chain payment is always credited even after the intent TTL'd away.
       const intent = await PaymentIntent.findOne({ schoolId, memo, status: 'pending' });
-      if (!intent) { summary.unmatched++; continue; }
-
-      const student = await Student.findOne({ schoolId, studentId: intent.studentId });
+      let student;
+      if (intent) {
+        student = await Student.findOne({ schoolId, studentId: intent.studentId });
+      } else {
+        student = await Student.findOne({ schoolId, studentId: memo });
+      }
       if (!student) { summary.unmatched++; continue; }
 
       summary.matched++;
@@ -467,12 +655,6 @@ async function syncPaymentsForSchool(school) {
       const senderAddress = payOp.from || null;
       const txDate = new Date(tx.created_at);
       const txLedger = tx.ledger_attr || tx.ledger || null;
-      const isConfirmed = txLedger
-        ? await checkConfirmationStatus(txLedger)
-        : false;
-      const confirmationStatus = isConfirmed
-        ? "confirmed"
-        : "pending_confirmation";
 
       const collision = await detectMemoCollision(
         memo,
@@ -482,9 +664,31 @@ async function syncPaymentsForSchool(school) {
         txDate,
         schoolId,
       );
+      const crossSchoolCollision = await detectCrossSchoolMemoCollision(
+        memo,
+        schoolId,
+        txDate,
+      );
+      const isSuspicious = collision.suspicious || crossSchoolCollision.suspicious;
+      const suspicionReason =
+        [collision.reason, crossSchoolCollision.reason].filter(Boolean).join('; ') || null;
+
+      const confirmation = await determineConfirmationState(
+        txLedger,
+        CONFIRMATION_STATES.DETECTED,
+        isSuspicious,
+      );
+      const isConfirmed = isConfirmedOrAbove(confirmation.state);
+      const confirmationStatus = confirmation.confirmationStatus;
+
+      const studentId = student.studentId;
+      // Fee amount and category come from the intent when one exists; otherwise
+      // fall back to the student's current fee record (intent-decoupled crediting).
+      const feeAmountForRecord = intent ? intent.amount : student.feeAmount;
+      const feeCategory = intent ? (intent.feeCategory || null) : null;
 
       const previousPayments = await Payment.aggregate([
-        { $match: { schoolId, studentId: intent.studentId, deletedAt: null } },
+        { $match: { schoolId, studentId, deletedAt: null } },
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ]);
       const previousTotal = previousPayments.length
@@ -494,102 +698,126 @@ async function syncPaymentsForSchool(school) {
         (previousTotal + paymentAmount).toFixed(7),
       );
 
+      // Partial payments are accepted in the sync path — cumulative total determines status.
+      // A single payment below the fee is recorded as 'partial' (credit toward remainingBalance).
+      // Compare in exact stroop space (#842) so an exact cumulative match is never
+      // mis-classified as partial/overpaid by a float rounding epsilon.
+      const cumulativeVsFee = compareAmounts(cumulativeTotal, student.feeAmount);
       let cumulativeStatus;
-      if (cumulativeTotal < student.feeAmount) cumulativeStatus = "partial";
-      else if (cumulativeTotal > student.feeAmount)
-        cumulativeStatus = "overpaid";
+      if (cumulativeVsFee < 0) cumulativeStatus = "partial";
+      else if (cumulativeVsFee > 0) cumulativeStatus = "overpaid";
       else cumulativeStatus = "valid";
 
       const excessAmount =
         cumulativeStatus === "overpaid"
-          ? parseFloat((cumulativeTotal - student.feeAmount).toFixed(7))
+          ? stroopsToNumber(toStroops(cumulativeTotal) - toStroops(student.feeAmount))
           : 0;
 
-      // In the sync path, partial payments are accepted — the cumulative status
-      // (partial / valid / overpaid) is what gets recorded. Per-transaction
-      // underpaid rejection is intentionally skipped here; the verifyPayment
-      // endpoint still rejects underpaid single-payment verifications.
+      let session;
+      try {
+        session = await mongoose.connection.startSession();
+        await session.withTransaction(async () => {
+          await savePayment({
+            schoolId,
+            studentId,
+            txHash: tx.hash,
+            correlationId: deriveCorrelationId(tx.hash),
+            amount: paymentAmount,
+            feeAmount: feeAmountForRecord,
+            feeCategory,
+            feeValidationStatus: cumulativeStatus,
+            excessAmount,
+            status: "SUCCESS",
+            memo,
+            senderAddress,
+            isSuspicious,
+            suspicionReason,
+            ledger: txLedger,
+            ledgerSequence: txLedger,
+            confirmationStatus,
+            confirmationState: confirmation.state,
+            confirmedAt: txDate,
+          }, { session });
 
-      await savePayment({
-        schoolId,
-        studentId: intent.studentId,
-        txHash: tx.hash,
-        amount: paymentAmount,
-        feeAmount: intent.amount,
-        feeCategory: intent.feeCategory || null,
-        feeValidationStatus: cumulativeStatus,
-        excessAmount,
-        status: "confirmed",
-        memo,
-        senderAddress,
-        isSuspicious: collision.suspicious,
-        suspicionReason: collision.reason,
-        ledger: txLedger,
-        confirmationStatus,
-        confirmedAt: txDate,
-      });
+          if (isConfirmed && !isSuspicious) {
+            const updateData = {
+              totalPaid: cumulativeTotal,
+              remainingBalance: parseFloat(Math.max(0, student.feeAmount - cumulativeTotal).toFixed(7)),
+              feePaid: cumulativeTotal >= student.feeAmount,
+            };
+
+            if (feeCategory && student.fees && student.fees.length > 0) {
+              const feeIndex = student.fees.findIndex(f => f.category === feeCategory);
+              if (feeIndex !== -1) {
+                const categoryPayments = await Payment.aggregate([
+                  {
+                    $match: {
+                      schoolId,
+                      studentId,
+                      feeCategory,
+                      confirmationStatus: "confirmed",
+                      isSuspicious: false,
+                      deletedAt: null,
+                    },
+                  },
+                  { $group: { _id: null, total: { $sum: "$amount" } } },
+                ]).session(session);
+                const categoryTotalPaid = categoryPayments.length
+                  ? parseFloat(categoryPayments[0].total.toFixed(7))
+                  : 0;
+
+                student.fees[feeIndex].totalPaid = categoryTotalPaid;
+                student.fees[feeIndex].remainingBalance = Math.max(
+                  0,
+                  student.fees[feeIndex].amount - categoryTotalPaid
+                );
+                student.fees[feeIndex].paid = categoryTotalPaid >= student.fees[feeIndex].amount;
+                updateData.fees = student.fees;
+              }
+            }
+
+            await Student.findOneAndUpdate(
+              { schoolId, studentId },
+              updateData,
+              { session }
+            );
+          }
+
+          if (intent) {
+            await PaymentIntent.findByIdAndUpdate(
+              intent._id,
+              { status: "completed" },
+              { session }
+            );
+          }
+        });
+      } catch (saveErr) {
+        if (saveErr.code === 'DUPLICATE_TX') {
+          // Another concurrent path (poller or verify) already recorded this tx.
+          // Treat as already-processed rather than an error.
+          summary.new--;
+          summary.alreadyProcessed++;
+          if (intent) {
+            await PaymentIntent.findByIdAndUpdate(intent._id, { status: 'completed' });
+          }
+          continue;
+        }
+        throw saveErr;
+      } finally {
+        if (session) await session.endSession();
+      }
       newPayments++;
 
       logger.info("Transaction recorded", {
         txHash: tx.hash,
         schoolId,
-        studentId: intent.studentId,
+        studentId,
         amount: paymentAmount,
         feeValidationStatus: cumulativeStatus,
-        isSuspicious: collision.suspicious,
+        isSuspicious,
         confirmationStatus,
-      });
-
-      if (isConfirmed && !collision.suspicious) {
-        // Update student record
-        const updateData = {
-          totalPaid: cumulativeTotal,
-          remainingBalance: parseFloat(Math.max(0, student.feeAmount - cumulativeTotal).toFixed(7)),
-          feePaid: cumulativeTotal >= student.feeAmount,
-        };
-
-        // If this payment is for a specific fee category, update that category's paid status
-        if (intent.feeCategory && student.fees && student.fees.length > 0) {
-          const feeIndex = student.fees.findIndex(f => f.category === intent.feeCategory);
-          if (feeIndex !== -1) {
-            // Calculate new total paid for this category
-            const categoryPayments = await Payment.aggregate([
-              {
-                $match: {
-                  schoolId,
-                  studentId: intent.studentId,
-                  feeCategory: intent.feeCategory,
-                  confirmationStatus: "confirmed",
-                  isSuspicious: false,
-                  deletedAt: null,
-                },
-              },
-              { $group: { _id: null, total: { $sum: "$amount" } } },
-            ]);
-            const categoryTotalPaid = categoryPayments.length
-              ? parseFloat(categoryPayments[0].total.toFixed(7))
-              : 0;
-
-            // Update the specific fee category
-            student.fees[feeIndex].totalPaid = categoryTotalPaid;
-            student.fees[feeIndex].remainingBalance = Math.max(
-              0,
-              student.fees[feeIndex].amount - categoryTotalPaid
-            );
-            student.fees[feeIndex].paid = categoryTotalPaid >= student.fees[feeIndex].amount;
-
-            updateData.fees = student.fees;
-          }
-        }
-
-        await Student.findOneAndUpdate(
-          { schoolId, studentId: intent.studentId },
-          updateData,
-        );
-      }
-
-      await PaymentIntent.findByIdAndUpdate(intent._id, {
-        status: "completed",
+        confirmationState: confirmation.state,
+        intentMatched: Boolean(intent),
       });
     }
 
@@ -603,32 +831,51 @@ async function syncPaymentsForSchool(school) {
   }
 
   return summary;
-  return { newPayments };
 }
 
 /**
- * Re-check all pending_confirmation payments for a school and promote them
- * to confirmed once the ledger threshold has been met.
+ * Re-check all non-terminal payments for a school and advance each one
+ * (detected/pending -> confirmed -> finalized) per the finality policy
+ * (issue #747). Safe to call repeatedly/concurrently for the same school:
+ * `determineConfirmationState` is idempotent, so a re-run over an unchanged
+ * ledger range leaves already-resolved payments untouched.
+ *
+ * Falls back to the legacy `confirmationStatus` field for payments written
+ * before `confirmationState` existed, so older pending records keep getting
+ * swept without a separate migration step.
  *
  * @param {string} schoolId
  */
 async function finalizeConfirmedPayments(schoolId) {
   const pending = await Payment.find({
     schoolId,
-    confirmationStatus: "pending_confirmation",
     isSuspicious: false,
+    $or: [
+      { confirmationState: { $in: [CONFIRMATION_STATES.DETECTED, CONFIRMATION_STATES.PENDING, CONFIRMATION_STATES.CONFIRMED] } },
+      { confirmationState: { $exists: false }, confirmationStatus: "pending_confirmation" },
+    ],
   });
 
   for (const payment of pending) {
-    if (!payment.ledgerSequence) continue;
-    const isConfirmed = await checkConfirmationStatus(payment.ledgerSequence);
-    if (!isConfirmed) continue;
+    const txLedger = payment.ledgerSequence || payment.ledger;
+    if (!txLedger) continue;
+
+    const currentState = payment.confirmationState || CONFIRMATION_STATES.DETECTED;
+    const { state: nextState, changed } = await determineConfirmationState(
+      txLedger,
+      currentState,
+      payment.isSuspicious,
+    );
+    if (!changed) continue;
 
     if (typeof Payment.findByIdAndUpdate === "function") {
       await Payment.findByIdAndUpdate(payment._id, {
-        confirmationStatus: "confirmed",
+        confirmationState: nextState,
+        confirmationStatus: deriveLegacyConfirmationStatus(nextState),
       });
     }
+
+    if (!isConfirmedOrAbove(nextState)) continue;
 
     const student = await Student.findOne({
       schoolId,
@@ -643,6 +890,7 @@ async function finalizeConfirmedPayments(schoolId) {
           studentId: payment.studentId,
           confirmationStatus: "confirmed",
           isSuspicious: false,
+          deletedAt: null,
         },
       },
       { $group: { _id: null, total: { $sum: "$amount" } } },
@@ -664,6 +912,7 @@ async function finalizeConfirmedPayments(schoolId) {
             feeCategory: { $ne: null },
             confirmationStatus: "confirmed",
             isSuspicious: false,
+            deletedAt: null,
           },
         },
         {
@@ -755,6 +1004,15 @@ module.exports = {
   normalizeAmount,
   extractValidPayment,
   detectMemoCollision,
+  detectCrossSchoolMemoCollision,
   detectAbnormalPatterns,
+  computeHistoricalAmountStats,
   checkConfirmationStatus,
+  // Consumed by transactionPollingService (import + call) and covered by tests —
+  // must be exported or those callers invoke `undefined`.
+  determineConfirmationState,
+  // recordPayment was moved to transactionService.savePayment (db layer split);
+  // re-exported under its original name since paymentController, retryService,
+  // transactionQueueService, and transactionRetryQueue still import it from here.
+  recordPayment: savePayment,
 };
