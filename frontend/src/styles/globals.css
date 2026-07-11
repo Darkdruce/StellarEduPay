@@ -278,6 +278,17 @@ h4 { font-size: 0.9375rem; font-weight: 700; margin-bottom: 0.25rem; }
 
 .app-main { flex: 1; min-width: 0; overflow-x: hidden; }
 
+/* Auth-gate placeholder shown while the route guard verifies/redirects */
+.app-auth-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40vh;
+  padding: 4rem 1rem;
+  color: var(--text-muted, #64748b);
+  font-size: 0.95rem;
+}
+
 /* Page wrappers */
 .page-wrap {
   max-width: 1080px;
